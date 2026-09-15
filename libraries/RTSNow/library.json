@@ -1,0 +1,11 @@
+{
+    "name": "RTSNow",
+    "version": "0.1.0",
+    "description": "RTS-NOW ESP-NOW wire protocol and a reusable 'simple node' helper (announce/heartbeat/settings/friendlyName persistence) shared across every RTS project's node firmware. Canonical source lives here, in RTS-ESPNOW-Gateway - see ../../PROTOCOL.md for the design rationale. Consuming projects pull this in via lib_extra_dirs rather than keeping their own copy.",
+    "keywords": ["esp-now", "rts-now"],
+    "frameworks": "arduino",
+    "platforms": "espressif32",
+    "build": {
+        "srcFilter": ["+<*.cpp>", "+<*.h>"]
+    }
+}

@@ -1,0 +1,728 @@
+from datetime import datetime
+from pathlib import Path
+
+from PySide6.QtCore import QTimer, Qt
+from PySide6.QtGui import QPixmap
+from PySide6.QtWidgets import (
+    QComboBox,
+    QHBoxLayout,
+    QLabel,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMessageBox,
+    QPlainTextEdit,
+    QPushButton,
+    QSpinBox,
+    QSplitter,
+    QStackedWidget,
+    QTabWidget,
+    QVBoxLayout,
+    QWidget,
+)
+
+from src.gateway.models import KnownDevice
+from src.gateway.node_flasher import ChipMacReader, NodeFlasherClient
+from src.gateway.ota_client import OtaPushClient
+from src.gateway.ports import list_serial_ports
+from src.gateway.serial_client import GatewayClient
+from src.ui.pages.dashboard_page import DashboardPage
+from src.ui.pages.flash_node_page import FlashNodePage
+from src.ui.pages.node_detail_page import NodeDetailPage
+from src.ui.pages.rtsnow_page import RtsNowPage
+
+POLL_INTERVAL_MS = 2000
+VERIFY_TIMEOUT_MS = 3000
+RENAME_CONFIRM_TIMEOUT_MS = 5000
+RTSNOW_CHANNEL_MIN = 1
+RTSNOW_CHANNEL_MAX = 11
+
+# main_window.py -> src/ui/ -> assets/RTSLOGO.png (Ristola Technical
+# Services' own logo, copied in from the sibling SPI-IM project's Assets/
+# folder rather than referenced across repos - see this app's own
+# assets/ directory, not a path into another project).
+_LOGO_PATH = Path(__file__).resolve().parent / "assets" / "RTSLOGO.png"
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("RTS ESP-NOW Gateway")
+        self.resize(1200, 750)
+
+        self.client: GatewayClient | None = None
+        self._connected_port: str | None = None
+        self.known_devices: dict[str, KnownDevice] = {}
+        self._pending_acks: dict[int, str] = {}
+        self._ota_client: OtaPushClient | None = None
+        self._verified = False  # confirmed the connected port is actually an RTS ESP-NOW Gateway
+        self._node_flasher: NodeFlasherClient | None = None
+        self._mac_readers: list[ChipMacReader] = []
+        self._scan_results: list[dict] = []
+        self._scan_pending_ports: list[tuple[str, str]] = []  # (port, description) still to read
+        self._pending_renames: dict[str, QTimer] = {}  # mac -> confirmation timeout timer
+
+        self._poll_timer = QTimer(self)
+        self._poll_timer.timeout.connect(self._poll_gateway)
+
+        self._verify_timer = QTimer(self)
+        self._verify_timer.setSingleShot(True)
+        self._verify_timer.timeout.connect(self._on_verify_timeout)
+
+        self._build_ui()
+        self._refresh_ports()
+        self._set_connected_ui(False)
+
+    # ---- UI construction ----
+
+    def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+
+        root.addLayout(self._build_connection_bar())
+
+        body_splitter = QSplitter(Qt.Orientation.Vertical)
+
+        top_splitter = QSplitter(Qt.Orientation.Horizontal)
+        sidebar = self._build_sidebar()
+        pages = self._build_pages()
+        top_splitter.addWidget(sidebar)
+        top_splitter.addWidget(pages)
+        top_splitter.setStretchFactor(0, 0)
+        top_splitter.setStretchFactor(1, 1)
+        body_splitter.addWidget(top_splitter)
+
+        # Wire up navigation only once both the sidebar and the pages it
+        # controls exist - connecting/selecting earlier would fire
+        # _on_sidebar_item_changed before self.pages exists. self.sidebar is
+        # the actual QListWidget - _build_sidebar() returns a container
+        # widget (logo + the list) for layout purposes only.
+        self.sidebar.currentItemChanged.connect(self._on_sidebar_item_changed)
+        self.sidebar.setCurrentRow(0)
+
+        body_splitter.addWidget(self._build_log_panel())
+        body_splitter.setStretchFactor(0, 3)
+        body_splitter.setStretchFactor(1, 1)
+        root.addWidget(body_splitter, stretch=1)
+
+        self.statusBar().showMessage("Not connected")
+
+    def _build_connection_bar(self) -> QHBoxLayout:
+        bar = QHBoxLayout()
+
+        bar.addWidget(QLabel("Port:"))
+        self.port_combo = QComboBox()
+        self.port_combo.setMinimumWidth(280)
+        bar.addWidget(self.port_combo)
+
+        refresh_ports_btn = QPushButton("Refresh Ports")
+        refresh_ports_btn.clicked.connect(self._refresh_ports)
+        bar.addWidget(refresh_ports_btn)
+
+        self.connect_btn = QPushButton("Connect")
+        self.connect_btn.clicked.connect(self._on_connect_clicked)
+        bar.addWidget(self.connect_btn)
+
+        bar.addSpacing(24)
+        bar.addWidget(QLabel("Channel:"))
+        self.channel_spin = QSpinBox()
+        self.channel_spin.setRange(RTSNOW_CHANNEL_MIN, RTSNOW_CHANNEL_MAX)
+        bar.addWidget(self.channel_spin)
+        self.apply_channel_btn = QPushButton("Apply")
+        self.apply_channel_btn.clicked.connect(self._on_apply_channel)
+        bar.addWidget(self.apply_channel_btn)
+
+        bar.addSpacing(24)
+        self.discover_btn = QPushButton("Discover Now")
+        self.discover_btn.clicked.connect(self._on_discover_clicked)
+        bar.addWidget(self.discover_btn)
+
+        bar.addStretch(1)
+        return bar
+
+    # Sidebar items carry a (role, payload) tuple in Qt.ItemDataRole.UserRole
+    # instead of relying on row index == page index - each project
+    # header's per-device children (see _rebuild_children_for_project)
+    # are inserted/removed dynamically as known_devices updates, so a fixed index
+    # mapping would break the moment the device count changed.
+    _RTSNOW_CHILD_INDENT = "   "  # 3 spaces, per request: "tab under RTSNow by 2-3 spaces"
+
+    def _add_nav_item(self, sidebar: QListWidget, label: str, role: tuple, row: int | None = None) -> QListWidgetItem:
+        item = QListWidgetItem(label)
+        item.setData(Qt.ItemDataRole.UserRole, role)
+        if row is None:
+            sidebar.addItem(item)
+        else:
+            sidebar.insertItem(row, item)
+        return item
+
+    def _build_sidebar(self) -> QWidget:
+        container = QWidget()
+        container.setMaximumWidth(200)
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        branding = QWidget()
+        branding_layout = QVBoxLayout(branding)
+        branding_layout.setContentsMargins(8, 12, 8, 12)
+
+        logo_label = QLabel()
+        pixmap = QPixmap(str(_LOGO_PATH))
+        if not pixmap.isNull():
+            logo_label.setPixmap(
+                pixmap.scaledToWidth(160, Qt.TransformationMode.SmoothTransformation)
+            )
+        logo_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        branding_layout.addWidget(logo_label)
+
+        layout.addWidget(branding)
+
+        sidebar = QListWidget()
+        self._add_nav_item(sidebar, "Dashboard", ("dashboard", None))
+        self._add_nav_item(sidebar, self._RTSNOW_CHILD_INDENT + "Flash Node", ("flash_node", None))
+        separator = self._add_nav_item(sidebar, "", ("separator", None))
+        separator.setFlags(Qt.ItemFlag.NoItemFlags)  # blank spacer row - not selectable/clickable
+        self._add_nav_item(sidebar, "RTSNow", ("rtsnow", None))
+        # Each project's per-device children are inserted here dynamically
+        # - see _rebuild_children_for_project(), called every time a
+        # known_devices snapshot arrives. There's no standalone "Node
+        # Detail" item any more - it's only ever reached by clicking a
+        # device (one of these children, or a row in the Dashboard's
+        # known-devices table).
+        pp_separator = self._add_nav_item(sidebar, "", ("separator", None))
+        pp_separator.setFlags(Qt.ItemFlag.NoItemFlags)  # blank spacer row - not selectable/clickable
+        self._add_nav_item(sidebar, "PolymerPak", ("polymerpak", None))
+        self.sidebar = sidebar
+        layout.addWidget(sidebar, stretch=1)
+
+        return container
+
+    # Every project section's device children share this same "device"
+    # role (see _on_sidebar_item_changed) - a rebuild identifies which
+    # rows belong to *its* project by looking up known_devices for each
+    # existing "device" row rather than a per-project role string, so
+    # rebuilding one project's section never disturbs another's.
+    def _rebuild_all_project_children(self):
+        self._rebuild_children_for_project("rtsnow", "RTSNow")
+        self._rebuild_children_for_project("polymerpak", "PolymerPak")
+
+    def _rebuild_children_for_project(self, header_role: str, project_name: str):
+        """Keeps one sidebar child per known device belonging to
+        `project_name`, indented under the sidebar item tagged
+        `(header_role, None)` (see _build_sidebar) - clicking one jumps
+        straight to that device's Node Detail page.
+
+        Skips the teardown/rebuild entirely when the desired (mac, label)
+        sequence already matches what's on the sidebar - this runs on
+        every known_devices snapshot (every POLL_INTERVAL_MS), and the
+        device list is unchanged on almost all of those. Removing the
+        currently-selected item from a QListWidget (even to immediately
+        reinsert an equivalent one) can make Qt briefly auto-select
+        whatever slides into that row before this function's own
+        reselection logic runs, firing an extra currentItemChanged for
+        that wrong intermediate item - visible as the Node Detail page
+        (and whatever it was showing, e.g. just-polled register values)
+        randomly flashing away mid-view. Rebuilding only when something
+        actually changed avoids that almost entirely."""
+        show_online_only = self.node_network_page.is_online_only()
+        devices = sorted(
+            (
+                dev for dev in self.known_devices.values()
+                if dev.project_name == project_name
+                and (not show_online_only or self.node_network_page.is_online(dev))
+            ),
+            key=lambda dev: dev.friendly_name.lower(),
+        )
+        desired = [(dev.mac, self._RTSNOW_CHILD_INDENT + dev.friendly_name) for dev in devices]
+
+        def existing_rows():
+            rows = []
+            for row in range(self.sidebar.count()):
+                role, payload = self.sidebar.item(row).data(Qt.ItemDataRole.UserRole)
+                if role != "device":
+                    continue
+                dev = self.known_devices.get(payload)
+                if dev is not None and dev.project_name == project_name:
+                    rows.append((row, payload, self.sidebar.item(row).text()))
+            return rows
+
+        existing = [(mac, label) for _row, mac, label in existing_rows()]
+        if desired == existing:
+            return
+
+        current = self.sidebar.currentItem()
+        current_role = current.data(Qt.ItemDataRole.UserRole) if current is not None else None
+
+        for row, _mac, _label in reversed(existing_rows()):
+            self.sidebar.takeItem(row)
+
+        insert_at = None
+        for row in range(self.sidebar.count()):
+            role, _ = self.sidebar.item(row).data(Qt.ItemDataRole.UserRole)
+            if role == header_role:
+                insert_at = row + 1
+                break
+        if insert_at is None:
+            return
+
+        for dev in devices:
+            self._add_nav_item(
+                self.sidebar,
+                self._RTSNOW_CHILD_INDENT + dev.friendly_name,
+                ("device", dev.mac),
+                row=insert_at,
+            )
+            insert_at += 1
+
+        # Re-select the equivalent recreated child if that's what was
+        # showing before this rebuild - the old QListWidgetItem was just
+        # deleted above, so the selection would otherwise silently drop to
+        # nothing every time a known_devices snapshot refreshes (every
+        # POLL_INTERVAL_MS).
+        if current_role is not None and current_role[0] == "device":
+            mac = current_role[1]
+            for row in range(self.sidebar.count()):
+                role, payload = self.sidebar.item(row).data(Qt.ItemDataRole.UserRole)
+                if role == "device" and payload == mac:
+                    self.sidebar.setCurrentRow(row)
+                    break
+
+    def _build_pages(self) -> QStackedWidget:
+        self.pages = QStackedWidget()
+
+        self.dashboard_page = DashboardPage()
+        self.pages.addWidget(self.dashboard_page)
+
+        self.rtsnow_page = RtsNowPage()
+        self.pages.addWidget(self.rtsnow_page)
+
+        # Node Network is no longer its own sidebar page - its tables/
+        # actions live embedded in the Dashboard's Nodes section (see
+        # DashboardPage). Keep this alias so every other call site below
+        # that already refers to self.node_network_page doesn't need to
+        # change.
+        self.node_network_page = self.dashboard_page.node_network
+        self.node_network_page.node_selected.connect(self._on_node_selected)
+        self.node_network_page.online_only_toggled.connect(lambda _checked: self._rebuild_all_project_children())
+
+        self.node_detail_page = NodeDetailPage()
+        self.node_detail_page.rename_requested.connect(self._on_rename_requested)
+        self.node_detail_page.ota_requested.connect(self._on_ota_requested)
+        self.node_detail_page.reboot_requested.connect(self._on_reboot_requested)
+        self.node_detail_page.poll_registers_requested.connect(self._on_poll_registers_requested)
+        self.node_detail_page.config_setting_requested.connect(self._on_config_setting_requested)
+        self.pages.addWidget(self.node_detail_page)
+
+        self.flash_node_page = FlashNodePage()
+        self.flash_node_page.scan_requested.connect(self._on_scan_nodes_requested)
+        self.flash_node_page.flash_requested.connect(self._on_flash_node_requested)
+        self.pages.addWidget(self.flash_node_page)
+
+        return self.pages
+
+    def _build_log_panel(self) -> QWidget:
+        tabs = QTabWidget()
+
+        self.activity_log = QPlainTextEdit()
+        self.activity_log.setReadOnly(True)
+        tabs.addTab(self.activity_log, "Activity Log")
+
+        self.raw_log = QPlainTextEdit()
+        self.raw_log.setReadOnly(True)
+        self.raw_log.setStyleSheet("font-family: monospace;")
+        tabs.addTab(self.raw_log, "Raw Serial")
+
+        return tabs
+
+    def _on_sidebar_item_changed(self, current: QListWidgetItem, previous: QListWidgetItem):
+        if current is None:
+            return
+        role, payload = current.data(Qt.ItemDataRole.UserRole)
+        if role == "dashboard":
+            self.pages.setCurrentWidget(self.dashboard_page)
+        elif role == "rtsnow":
+            self.pages.setCurrentWidget(self.rtsnow_page)
+        elif role == "flash_node":
+            self.pages.setCurrentWidget(self.flash_node_page)
+        elif role == "device":
+            dev = self.known_devices.get(payload)
+            if dev is not None:
+                self.node_detail_page.show_device(dev)
+            self.pages.setCurrentWidget(self.node_detail_page)
+
+    def _on_node_selected(self, mac: str):
+        dev = self.known_devices.get(mac)
+        if dev is None:
+            return
+        self.node_detail_page.show_device(dev)
+        # Node Detail has no sidebar item of its own anymore - reached only
+        # by clicking a device, here (the Dashboard's known-devices table,
+        # any project) or one of RTSNow's per-device children. Just swap
+        # the page directly; the sidebar's own highlighted item (wherever
+        # the click came from) is left as-is rather than forced to match.
+        self.pages.setCurrentWidget(self.node_detail_page)
+
+    # ---- Connection management ----
+
+    def _refresh_ports(self):
+        self.port_combo.clear()
+        for port in list_serial_ports():
+            self.port_combo.addItem(port.label, userData=port.device)
+
+    def _set_connected_ui(self, connected: bool):
+        self.port_combo.setEnabled(not connected)
+        self.connect_btn.setText("Disconnect" if connected else "Connect")
+        self.apply_channel_btn.setEnabled(connected)
+        self.discover_btn.setEnabled(connected)
+        self.channel_spin.setEnabled(connected)
+        self.node_network_page.set_enabled(connected)
+        self.node_detail_page.set_enabled(connected)
+        self.flash_node_page.set_enabled(connected)
+        if not connected:
+            self.dashboard_page.reset()
+
+    def _on_connect_clicked(self):
+        if self.client is not None:
+            self._disconnect()
+            return
+
+        port = self.port_combo.currentData()
+        if not port:
+            QMessageBox.warning(self, "No port selected", "Select a serial port first.")
+            return
+
+        self.client = GatewayClient(port)
+        self.client.event_received.connect(self._on_event_received)
+        self.client.raw_line.connect(self._on_raw_line)
+        self.client.error.connect(self._on_client_error)
+        self.client.disconnected.connect(self._on_client_disconnected)
+        self.client.start()
+
+        self._connected_port = port
+        self._verified = False
+        self._set_connected_ui(True)
+
+        port_info = next((p for p in list_serial_ports() if p.device == port), None)
+        self.dashboard_page.set_mac(port_info.serial_number if port_info else None)
+
+        self.dashboard_page.set_connection_status(f"Connected to {port} - verifying it's a gateway...")
+        self.statusBar().showMessage(f"Connected to {port} - verifying...")
+        self._log(f"Connecting to {port}...")
+
+        # Any well-formed JSON event proves this is really an RTS ESP-NOW
+        # Gateway - node-firmware has no JSON emitter at all, so it can
+        # never produce one, no matter what it's sent. `hello` doubles as
+        # the verification probe and populates the Dashboard's gateway
+        # info immediately, rather than only ever getting it if the app
+        # happened to already be connected at the exact moment the gateway
+        # itself booted (its only other source). Give up (auto-disconnect)
+        # if nothing valid comes back in time - see _on_verify_timeout.
+        # This is the real guard; the port dropdown is just a convenience,
+        # not something to trust blindly (both boards enumerate
+        # identically at the OS level - see TASKS.md).
+        self.client.send_command({"cmd": "hello"})
+        self._verify_timer.start(VERIFY_TIMEOUT_MS)
+        self._poll_timer.start(POLL_INTERVAL_MS)
+
+    def _disconnect(self):
+        if self.client is not None:
+            self.client.stop()
+        self._poll_timer.stop()
+        self._verify_timer.stop()
+
+    def _on_client_disconnected(self):
+        self.client = None
+        self._connected_port = None
+        self._verified = False
+        self._set_connected_ui(False)
+        self.statusBar().showMessage("Not connected")
+        self._log("Disconnected.")
+
+    def _on_client_error(self, message: str):
+        self._log(f"ERROR: {message}")
+
+    def _on_verify_timeout(self):
+        if self.client is None or self._verified:
+            return
+        port = self.port_combo.currentData()
+        self._log(f"No response from {port} that looks like an RTS ESP-NOW Gateway - disconnecting.")
+        # _disconnect() stops the client thread, which emits its own
+        # `disconnected` signal (already wired to _on_client_disconnected)
+        # once it actually exits - don't call that handler again here.
+        self._disconnect()
+        QMessageBox.warning(
+            self, "Not a gateway",
+            f"{port} didn't respond like an RTS ESP-NOW Gateway within "
+            f"{VERIFY_TIMEOUT_MS // 1000}s (no JSON received).\n\n"
+            "This is probably a node's port, not the gateway's - check "
+            "Port and try again.",
+        )
+
+    # ---- Sending commands ----
+
+    def _send(self, cmd: dict, description: str):
+        if self.client is None:
+            return
+        request_id = self.client.send_command(cmd)
+        self._pending_acks[request_id] = description
+        self._log(f"-> {description}")
+
+    def _poll_gateway(self):
+        if self.client is None:
+            return
+        self.client.send_command({"cmd": "list"})
+
+    def _on_apply_channel(self):
+        value = self.channel_spin.value()
+        self._send({"cmd": "channel", "value": value}, f"set channel to {value}")
+
+    def _on_discover_clicked(self):
+        self._send({"cmd": "discover"}, "discover")
+
+    def _on_rename_requested(self, mac: str, new_name: str):
+        # "friendlyName" is a reserved setting key node-firmware
+        # specifically recognizes: it renames itself and persists the
+        # name in NVS (see PROTOCOL.md's "Generic settings"). Just a
+        # regular `setting` command on the wire - no new gateway command
+        # needed for this.
+        #
+        # The command's own `ack` only means the gateway accepted and
+        # forwarded it over ESP-NOW - NOT that the node actually received
+        # or applied it (found this out the hard way: a node that had
+        # gone silent still got an `ok:true` ack back, since the gateway
+        # doesn't wait for the node's actual RTSNOW_SETTING_ACK before
+        # answering the JSON command). The real confirmation is the
+        # separate, unsolicited `setting_ack` event below - track it with
+        # a timeout so the UI doesn't just trust the immediate ack.
+        self._send(
+            {"cmd": "setting", "mac": mac, "key": "friendlyName", "valueType": "string", "value": new_name},
+            f"rename {mac} to \"{new_name}\"",
+        )
+        old_timer = self._pending_renames.pop(mac, None)
+        if old_timer is not None:
+            old_timer.stop()
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(lambda: self._on_rename_confirm_timeout(mac))
+        self._pending_renames[mac] = timer
+        timer.start(RENAME_CONFIRM_TIMEOUT_MS)
+
+    def _on_rename_confirm_timeout(self, mac: str):
+        self._pending_renames.pop(mac, None)
+        self._log(f"No confirmation from {mac} for the rename - it may be offline.")
+        if self.node_detail_page.current_mac() == mac:
+            self.node_detail_page.set_rename_status("No confirmation received - node may be offline.")
+
+    def _on_reboot_requested(self, mac: str):
+        # Same caveat as rename above: this `ack` only confirms the gateway
+        # sent the ESP-NOW packet, not that the node received or acted on
+        # it. There's no reboot-specific confirmation event (see
+        # PROTOCOL.md's "Remote control" section) - a node that actually
+        # reboots will show back up via its own next device_announced/
+        # heartbeat, same as any node coming back online.
+        self._send({"cmd": "reboot", "mac": mac}, f"reboot {mac}")
+
+    def _on_poll_registers_requested(self, mac: str):
+        self._send({"cmd": "poll_registers", "mac": mac}, f"poll_registers {mac}")
+
+    # key -> RTSNOW_SettingPayload.valueType (see SPI-IM's onRemoteSetting()
+    # in main.cpp/main_atom_node.cpp for the matching decode).
+    _CONFIG_SETTING_TYPES = {
+        "equipmentType": "string",
+        "model": "string",
+        "spiAddress": "int",
+        "spiBaudRate": "int",
+        # PolymerPak's solar-math settings (see that project's
+        # TrackerSettings.h/main.cpp's onRemoteSetting()) - not SPI-IM's.
+        "siteLatitude": "float",
+        "siteLongitude": "float",
+        "sunElevationDeg": "float",
+        "trackerStepDeg": "float",
+    }
+
+    def _on_config_setting_requested(self, mac: str, key: str, value):
+        value_type = self._CONFIG_SETTING_TYPES.get(key, "string")
+        self._send(
+            {"cmd": "setting", "mac": mac, "key": key, "valueType": value_type, "value": value},
+            f"setting {mac} {key}={value}",
+        )
+
+    def _on_ota_requested(self, ip: str, file_path: str):
+        if self._ota_client is not None:
+            QMessageBox.warning(self, "OTA in progress", "Wait for the current OTA update to finish first.")
+            return
+        self._log(f"-> OTA push to {ip}: {file_path}")
+        self._ota_client = OtaPushClient(ip, file_path)
+        self._ota_client.progress.connect(self.node_detail_page.set_ota_progress)
+        self._ota_client.finished.connect(self._on_ota_finished)
+        self._ota_client.start()
+
+    def _on_ota_finished(self, success: bool, message: str):
+        self.node_detail_page.set_ota_result(success, message)
+        self._log(("OTA succeeded: " if success else "OTA FAILED: ") + message)
+        self._ota_client = None
+
+    # ---- Node onboarding (Flash Node page) ----
+
+    def _on_scan_nodes_requested(self):
+        if self._mac_readers:
+            return  # a scan is already in progress
+        self.flash_node_page.set_scanning(True)
+        self._scan_results = []
+        # Never touch the gateway's own port - esptool's MAC read resets
+        # whatever board is on the other end, which would interrupt the
+        # live gateway connection.
+        self._scan_pending_ports = [
+            (p.device, p.description) for p in list_serial_ports() if p.device != self._connected_port
+        ]
+        self._log(f"Scanning {len(self._scan_pending_ports)} port(s) for RTS-NOW nodes...")
+        self._scan_next_port()
+
+    def _scan_next_port(self):
+        if not self._scan_pending_ports:
+            self.flash_node_page.set_scanning(False)
+            self.flash_node_page.update_rows(self._scan_results)
+            self._log(f"Scan complete: {len(self._scan_results)} port(s) checked.")
+            return
+
+        port, description = self._scan_pending_ports.pop(0)
+        self._scan_current_description = description
+        reader = ChipMacReader(port)
+        reader.result.connect(self._on_mac_read_result)
+        self._mac_readers = [reader]
+        reader.start()
+
+    def _on_mac_read_result(self, port: str, mac):
+        if mac is None:
+            status = "unreadable"
+        elif mac in self.known_devices:
+            status = "known"
+        else:
+            status = "unprovisioned"
+        self._scan_results.append(
+            {"port": port, "description": self._scan_current_description, "mac": mac, "status": status}
+        )
+        self._mac_readers = []
+        self._scan_next_port()
+
+    def _on_flash_node_requested(self, port: str, project_dir: str, environment: str):
+        if self._node_flasher is not None:
+            QMessageBox.warning(self, "Flash in progress", "Wait for the current flash to finish first.")
+            return
+        self._log(f"-> Flashing {project_dir} to {port}")
+        self._node_flasher = NodeFlasherClient(project_dir, port, environment or None)
+        self._node_flasher.progress.connect(self.flash_node_page.set_flash_progress)
+        self._node_flasher.log_line.connect(self.flash_node_page.append_log)
+        self._node_flasher.finished.connect(self._on_node_flash_finished)
+        self._node_flasher.start()
+
+    def _on_node_flash_finished(self, success: bool, message: str):
+        self.flash_node_page.set_flash_result(success, message)
+        self._log(("Node flash succeeded: " if success else "Node flash FAILED: ") + message)
+        self._node_flasher = None
+
+    # ---- Incoming events ----
+
+    def _on_event_received(self, obj: dict):
+        event = obj.get("event")
+
+        if not self._verified:
+            # Any well-formed JSON event at all proves this - see the
+            # comment in _on_connect_clicked.
+            self._verified = True
+            self._verify_timer.stop()
+            port = self.port_combo.currentData()
+            self.dashboard_page.set_connection_status(f"Connected to {port}")
+            self.statusBar().showMessage(f"Connected to {port}")
+            self._log("Confirmed: this is an RTS ESP-NOW Gateway.")
+
+        if event == "hello":
+            channel = obj.get("channel", RTSNOW_CHANNEL_MIN)
+            self.channel_spin.blockSignals(True)
+            self.channel_spin.setValue(channel)
+            self.channel_spin.blockSignals(False)
+            self.dashboard_page.set_gateway_info(obj.get("deviceID", 0), channel, obj.get("protocolVersion", 0))
+            self._log(
+                f"Gateway ready: deviceID=0x{obj.get('deviceID', 0):08X} "
+                f"channel={channel} protocolVersion={obj.get('protocolVersion')}"
+            )
+        elif event == "known_devices":
+            self._update_known_devices(obj.get("devices", []))
+        elif event == "ack":
+            self._handle_ack(obj)
+        elif event == "device_announced":
+            dev = obj.get("device", {})
+            self._log(f"New device announced: {dev.get('friendlyName')} ({dev.get('mac')})")
+        elif event == "provision_request":
+            req = obj.get("request", {})
+            self._log(f"New provisioning request: {req.get('friendlyName')} ({req.get('mac')})")
+            self._poll_gateway()
+        elif event == "provision_expired":
+            self._log(f"Provisioning request from {obj.get('mac')} expired.")
+        elif event == "provision_confirmed":
+            self._log(f"Provisioning confirmed: {obj.get('mac')} joined SSID \"{obj.get('ssid')}\".")
+        elif event == "provision_confirm_timeout":
+            self._log(f"No confirmation from {obj.get('mac')} after sending credentials for SSID \"{obj.get('ssid')}\".")
+        elif event == "setting_ack":
+            mac = obj.get("mac")
+            key = obj.get("key")
+            accepted = bool(obj.get("accepted"))
+            status = "accepted" if accepted else "rejected"
+            self._log(f"Setting \"{key}\" {status} by {mac}.")
+            if key == "friendlyName" and mac in self._pending_renames:
+                self._pending_renames.pop(mac).stop()
+                if self.node_detail_page.current_mac() == mac:
+                    self.node_detail_page.set_rename_status(
+                        "Confirmed by node." if accepted else "Node rejected the rename."
+                    )
+            elif key in (
+                "equipmentType", "model", "spiAddress", "spiBaudRate",
+                "siteLatitude", "siteLongitude", "sunElevationDeg", "trackerStepDeg",
+            ):
+                if self.node_detail_page.current_mac() == mac:
+                    self.node_detail_page.set_config_ack_status(key, accepted)
+        elif event == "register_values":
+            mac = obj.get("mac")
+            values = obj.get("values", [])
+            start_register = obj.get("startRegister", 0)
+            self._log(f"Received {len(values)} register(s) from {mac} starting at {start_register}.")
+            if self.node_detail_page.current_mac() == mac:
+                self.node_detail_page.show_register_values(start_register, values)
+        elif event == "channel_changed":
+            channel = obj.get("channel", RTSNOW_CHANNEL_MIN)
+            self.channel_spin.blockSignals(True)
+            self.channel_spin.setValue(channel)
+            self.channel_spin.blockSignals(False)
+            self.dashboard_page.set_channel(channel)
+            self._log(f"Gateway channel changed to {channel}.")
+        else:
+            self._log(f"Unhandled event: {obj}")
+
+    def _handle_ack(self, obj: dict):
+        request_id = obj.get("id")
+        description = self._pending_acks.pop(request_id, obj.get("cmd", "?"))
+        if obj.get("ok"):
+            self._log(f"OK: {description}")
+        else:
+            self._log(f"FAILED: {description}: {obj.get('error')}")
+
+    def _update_known_devices(self, devices_json: list[dict]):
+        self.known_devices = {d["mac"]: KnownDevice.from_json(d) for d in devices_json}
+        self.node_network_page.update_devices(devices_json)
+        self._rebuild_all_project_children()
+
+        current_mac = self.node_detail_page.current_mac()
+        if current_mac and current_mac in self.known_devices:
+            self.node_detail_page.refresh_if_current(self.known_devices[current_mac])
+
+    def _on_raw_line(self, line: str):
+        self.raw_log.appendPlainText(line)
+
+    def _log(self, message: str):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.activity_log.appendPlainText(f"[{timestamp}] {message}")
+
+    def closeEvent(self, event):
+        self._disconnect()
+        super().closeEvent(event)
