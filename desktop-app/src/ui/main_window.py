@@ -21,12 +21,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from src.gateway.device_info_client import DeviceInfoFetcher
 from src.gateway.models import KnownDevice
 from src.gateway.node_flasher import ChipMacReader, NodeFlasherClient
 from src.gateway.ota_client import OtaPushClient
 from src.gateway.ports import list_serial_ports
 from src.gateway.serial_client import GatewayClient
 from src.ui.pages.dashboard_page import DashboardPage
+from src.ui.pages.dryer_detail_page import DryerDetailPage
 from src.ui.pages.flash_node_page import FlashNodePage
 from src.ui.pages.node_detail_page import NodeDetailPage
 from src.ui.pages.rtsnow_page import RtsNowPage
@@ -61,6 +63,15 @@ class MainWindow(QMainWindow):
         self._scan_results: list[dict] = []
         self._scan_pending_ports: list[tuple[str, str]] = []  # (port, description) still to read
         self._pending_renames: dict[str, QTimer] = {}  # mac -> confirmation timeout timer
+
+        # equipmentType/model for RTSNow-project devices, fetched once per
+        # mac from the node's own /api/data (see DeviceInfoFetcher) -
+        # feeds both the RTSNow page's icon grid and _show_device_page()'s
+        # routing decision. Not part of KnownDevice/known_devices itself:
+        # that comes from ESP-NOW's device identity broadcast, which has
+        # no notion of equipmentType/model at all (see PROTOCOL.md).
+        self._device_info: dict[str, dict] = {}
+        self._info_fetchers: dict[str, DeviceInfoFetcher] = {}  # mac -> in-flight fetch
 
         self._poll_timer = QTimer(self)
         self._poll_timer.timeout.connect(self._poll_gateway)
@@ -295,6 +306,7 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self.dashboard_page)
 
         self.rtsnow_page = RtsNowPage()
+        self.rtsnow_page.device_selected.connect(self._on_rtsnow_device_selected)
         self.pages.addWidget(self.rtsnow_page)
 
         # Node Network is no longer its own sidebar page - its tables/
@@ -313,6 +325,9 @@ class MainWindow(QMainWindow):
         self.node_detail_page.poll_registers_requested.connect(self._on_poll_registers_requested)
         self.node_detail_page.config_setting_requested.connect(self._on_config_setting_requested)
         self.pages.addWidget(self.node_detail_page)
+
+        self.dryer_detail_page = DryerDetailPage()
+        self.pages.addWidget(self.dryer_detail_page)
 
         self.flash_node_page = FlashNodePage()
         self.flash_node_page.scan_requested.connect(self._on_scan_nodes_requested)
@@ -348,20 +363,37 @@ class MainWindow(QMainWindow):
         elif role == "device":
             dev = self.known_devices.get(payload)
             if dev is not None:
-                self.node_detail_page.show_device(dev)
-            self.pages.setCurrentWidget(self.node_detail_page)
+                self._show_device_page(dev)
 
     def _on_node_selected(self, mac: str):
         dev = self.known_devices.get(mac)
         if dev is None:
             return
-        self.node_detail_page.show_device(dev)
-        # Node Detail has no sidebar item of its own anymore - reached only
-        # by clicking a device, here (the Dashboard's known-devices table,
-        # any project) or one of RTSNow's per-device children. Just swap
-        # the page directly; the sidebar's own highlighted item (wherever
-        # the click came from) is left as-is rather than forced to match.
-        self.pages.setCurrentWidget(self.node_detail_page)
+        # Node Detail/Dryer Detail have no sidebar item of their own -
+        # reached only by clicking a device, here (the Dashboard's
+        # known-devices table, any project), one of RTSNow's per-device
+        # sidebar children, or an RTSNow page icon tile. Just swap the
+        # page directly; the sidebar's own highlighted item (wherever the
+        # click came from) is left as-is rather than forced to match.
+        self._show_device_page(dev)
+
+    def _on_rtsnow_device_selected(self, mac: str):
+        self._on_node_selected(mac)
+
+    def _show_device_page(self, dev: KnownDevice):
+        """Routes to the per-equipment-type detail page for `dev` - only
+        Dryer has one so far (DryerDetailPage); everything else (other
+        equipment types, or a device whose type isn't known yet - see
+        _device_info's comment) falls back to the generic NodeDetailPage,
+        same page every RTSNow device used exclusively before
+        DryerDetailPage existed."""
+        equipment_type = self._device_info.get(dev.mac, {}).get("equipmentType")
+        if equipment_type == "Dryer":
+            self.dryer_detail_page.show_device(dev)
+            self.pages.setCurrentWidget(self.dryer_detail_page)
+        else:
+            self.node_detail_page.show_device(dev)
+            self.pages.setCurrentWidget(self.node_detail_page)
 
     # ---- Connection management ----
 
@@ -381,6 +413,17 @@ class MainWindow(QMainWindow):
         self.flash_node_page.set_enabled(connected)
         if not connected:
             self.dashboard_page.reset()
+            # Not clearing _info_fetchers here - any still in flight are
+            # one-shot, self-terminating within DeviceInfoFetcher._TIMEOUT_S,
+            # and remove themselves from that dict via their own
+            # info_received/info_error signal once done (see
+            # _on_device_info_received/_error). Dropping this dict's
+            # references before that fires would risk destroying a QThread
+            # object whose underlying OS thread is still running -
+            # undefined behavior in Qt (same hazard DryerStatusPoller's
+            # STOP_WAIT_MS comment is about), not just a leak.
+            self._device_info = {}
+            self.rtsnow_page.update_devices([], {})
 
     def _on_connect_clicked(self):
         if self.client is not None:
@@ -712,9 +755,48 @@ class MainWindow(QMainWindow):
         self.node_network_page.update_devices(devices_json)
         self._rebuild_all_project_children()
 
+        rtsnow_devices = [dev for dev in self.known_devices.values() if dev.project_name == "RTSNow"]
+        for dev in rtsnow_devices:
+            self._ensure_device_info(dev)
+        self.rtsnow_page.update_devices(rtsnow_devices, self._device_info)
+
         current_mac = self.node_detail_page.current_mac()
         if current_mac and current_mac in self.known_devices:
             self.node_detail_page.refresh_if_current(self.known_devices[current_mac])
+        current_dryer_mac = self.dryer_detail_page.current_mac()
+        if current_dryer_mac and current_dryer_mac in self.known_devices:
+            self.dryer_detail_page.refresh_if_current(self.known_devices[current_dryer_mac])
+
+    def _ensure_device_info(self, dev: KnownDevice):
+        """Kicks off a one-shot equipmentType/model fetch for `dev` if it
+        doesn't have one cached (or in flight) yet - see _device_info's
+        comment. Never retries on its own: a device that's unreachable
+        right now (no ip yet, offline) just keeps the default "?" icon/
+        NodeDetailPage routing until a later known_devices snapshot calls
+        this again for it (every POLL_INTERVAL_MS) and it succeeds."""
+        if dev.mac in self._device_info or dev.mac in self._info_fetchers:
+            return
+        if not dev.ip:
+            return
+        fetcher = DeviceInfoFetcher(dev.mac, dev.ip)
+        fetcher.info_received.connect(self._on_device_info_received)
+        fetcher.info_error.connect(self._on_device_info_error)
+        self._info_fetchers[dev.mac] = fetcher
+        fetcher.start()
+
+    def _on_device_info_received(self, mac: str, data: dict):
+        self._info_fetchers.pop(mac, None)
+        self._device_info[mac] = data
+        rtsnow_devices = [dev for dev in self.known_devices.values() if dev.project_name == "RTSNow"]
+        self.rtsnow_page.update_devices(rtsnow_devices, self._device_info)
+
+    def _on_device_info_error(self, mac: str, _message: str):
+        self._info_fetchers.pop(mac, None)
+        # Deliberately doesn't cache a failure into _device_info - leaves
+        # this mac eligible for _ensure_device_info() to retry on the next
+        # known_devices snapshot instead of getting stuck on the default
+        # icon/routing forever after one bad request (e.g. the node was
+        # mid-reboot when this fired).
 
     def _on_raw_line(self, line: str):
         self.raw_log.appendPlainText(line)
@@ -725,4 +807,9 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._disconnect()
+        # Stop any live-status pollers before exiting - see
+        # NodeDetailPage.shutdown()'s comment (destroying a running
+        # QThread is undefined behavior in Qt, not just a leak).
+        self.node_detail_page.shutdown()
+        self.dryer_detail_page.shutdown()
         super().closeEvent(event)

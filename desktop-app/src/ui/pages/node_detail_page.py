@@ -502,6 +502,14 @@ class NodeDetailPage(QWidget):
     def current_mac(self) -> str | None:
         return self._mac
 
+    def shutdown(self):
+        """Call on application exit - destroying a QThread while its
+        underlying OS thread is still running is undefined behavior in Qt
+        (see _stop_polymerpak_poller's comment), and nothing else stops
+        this page's poller once the app is closing, not just navigated
+        away from."""
+        self._stop_polymerpak_poller()
+
     def _update_ota_enabled(self):
         self.ota_push_btn.setEnabled(bool(self._ip and self._ota_file_path))
 
