@@ -585,8 +585,19 @@ namespace
     uint32_t s_last_routing_recompute_ms = 0;
     constexpr uint32_t kRoutingRecomputeIntervalMs = 5000; // routing doesn't need to react instantly - a node's default 10s heartbeat interval already bounds how fresh the underlying RSSI data ever is anyway
 
+    // Debug/test-only escape hatch (force_route JSON command below) - lets a
+    // relay path be proven out on real hardware even when live RSSI sits
+    // right at kRelayImprovementThresholdDb's boundary rather than clearly
+    // past it. While true, recompute_routing_if_due() skips entirely so the
+    // forced routeViaDeviceId isn't immediately overwritten by the very
+    // next 5s recompute tick. Not exposed in the desktop app UI - only
+    // reachable by hand-sending the JSON command.
+    bool s_routingOverridden = false;
+
     void recompute_routing_if_due()
     {
+        if (s_routingOverridden)
+            return;
         uint32_t now = millis();
         if (now - s_last_routing_recompute_ms < kRoutingRecomputeIntervalMs)
             return;
@@ -1003,6 +1014,25 @@ namespace
         return nullptr;
     }
 
+    // Removes an already-known device from s_known_devices entirely (not
+    // to be confused with do_reject() above, which only ever touches
+    // s_pending[] - a device asking to JOIN, not one already provisioned).
+    // Purely local bookkeeping: doesn't tell the device anything (there's
+    // no "you've been forgotten" message in this protocol, and no need
+    // for one - it'll just reappear here on its next announce/heartbeat
+    // if it's still alive). Swap-with-last removal since display order
+    // was never guaranteed - the desktop app re-renders the whole list
+    // fresh from `list` every time regardless.
+    const char *do_forget(const uint8_t mac[6])
+    {
+        int idx = find_known_device_by_mac(mac);
+        if (idx < 0)
+            return "unknown MAC - it must have announced/heartbeated at least once (see `list`)";
+        s_known_devices[idx] = s_known_devices[s_known_device_count - 1];
+        s_known_device_count--;
+        return nullptr;
+    }
+
     // Sent kRemoteControlResendCount times rather than once, a beat
     // (kRemoteControlResendGapMs) apart - real-hardware testing found a
     // meaningfully high single-shot loss rate on this link (a single
@@ -1261,6 +1291,23 @@ namespace
         Serial.printf("Rejected %s - it should resume sweeping\n", macStr);
     }
 
+    void cmd_forget(const char *macStr)
+    {
+        uint8_t mac[6];
+        if (!parse_mac(macStr, mac))
+        {
+            Serial.println("forget: invalid MAC address");
+            return;
+        }
+        const char *error = do_forget(mac);
+        if (error != nullptr)
+        {
+            Serial.printf("forget: %s\n", error);
+            return;
+        }
+        Serial.printf("Forgot %s - it'll reappear if it announces/heartbeats again\n", macStr);
+    }
+
     // Auto-detects the setting's value type from its typed-in text form:
     // "true"/"false" -> bool, a clean integer -> int32, a clean float ->
     // float32, anything else -> string. A human-typed convenience, not
@@ -1422,6 +1469,14 @@ namespace
             else
                 cmd_reject(mac);
         }
+        else if (strcmp(cmd, "forget") == 0)
+        {
+            char *mac = strtok(nullptr, " ");
+            if (!mac)
+                Serial.println("usage: forget <mac>");
+            else
+                cmd_forget(mac);
+        }
         else if (strcmp(cmd, "setting") == 0)
         {
             char *mac = strtok(nullptr, " ");
@@ -1499,6 +1554,19 @@ namespace
         }
         const char *error = do_reject(mac);
         send_ack("reject", &doc, error == nullptr, error);
+    }
+
+    void handle_forget_command(const JsonDocument &doc)
+    {
+        const char *macStr = doc["mac"] | "";
+        uint8_t mac[6];
+        if (!parse_mac(macStr, mac))
+        {
+            send_ack("forget", &doc, false, "invalid MAC address");
+            return;
+        }
+        const char *error = do_forget(mac);
+        send_ack("forget", &doc, error == nullptr, error);
     }
 
     // Unlike the text interface's cmd_setting, the value's type comes from
@@ -1677,6 +1745,50 @@ namespace
         send_ack("channel", &doc, true);
     }
 
+    // Debug/test-only - see s_routingOverridden's own comment. viaMac ""
+    // clears the override for this target and resumes normal auto-routing;
+    // any other value pins routeViaDeviceId to that relay and freezes
+    // recompute_routing_if_due() globally until cleared.
+    void handle_force_route_command(const JsonDocument &doc)
+    {
+        const char *macStr = doc["mac"] | "";
+        const char *viaMacStr = doc["viaMac"] | "";
+        uint8_t mac[6];
+        if (!parse_mac(macStr, mac))
+        {
+            send_ack("force_route", &doc, false, "invalid MAC address");
+            return;
+        }
+        int targetIdx = find_known_device_by_mac(mac);
+        if (targetIdx < 0)
+        {
+            send_ack("force_route", &doc, false, "unknown target device");
+            return;
+        }
+        if (strlen(viaMacStr) == 0)
+        {
+            s_known_devices[targetIdx].routeViaDeviceId = 0;
+            s_routingOverridden = false;
+            send_ack("force_route", &doc, true, "cleared - normal auto-routing resumed");
+            return;
+        }
+        uint8_t viaMac[6];
+        if (!parse_mac(viaMacStr, viaMac))
+        {
+            send_ack("force_route", &doc, false, "invalid viaMac address");
+            return;
+        }
+        int relayIdx = find_known_device_by_mac(viaMac);
+        if (relayIdx < 0)
+        {
+            send_ack("force_route", &doc, false, "unknown relay device");
+            return;
+        }
+        s_known_devices[targetIdx].routeViaDeviceId = s_known_devices[relayIdx].deviceID;
+        s_routingOverridden = true;
+        send_ack("force_route", &doc, true, "forced - auto-routing frozen until cleared");
+    }
+
     void handle_json_line(char *line)
     {
         JsonDocument doc;
@@ -1698,6 +1810,8 @@ namespace
             handle_provision_command(doc);
         else if (strcmp(cmd, "reject") == 0)
             handle_reject_command(doc);
+        else if (strcmp(cmd, "forget") == 0)
+            handle_forget_command(doc);
         else if (strcmp(cmd, "setting") == 0)
             handle_setting_command(doc);
         else if (strcmp(cmd, "reboot") == 0)
@@ -1714,6 +1828,8 @@ namespace
             handle_espnow_ota_abort_command(doc);
         else if (strcmp(cmd, "channel") == 0)
             handle_channel_command(doc);
+        else if (strcmp(cmd, "force_route") == 0)
+            handle_force_route_command(doc);
         else if (strcmp(cmd, "discover") == 0)
         {
             send_broadcast(RTSNOW_DISCOVER, nullptr, 0);

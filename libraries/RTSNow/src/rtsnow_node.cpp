@@ -158,7 +158,7 @@ namespace
     // reported per heartbeat) - this table can track more peers than fit
     // in one heartbeat; buildNeighborList only reports the freshest ones
     // if it's ever actually full enough for that distinction to matter.
-    constexpr uint8_t kMaxPeers = 16;
+    constexpr uint8_t kMaxPeers = RTSNOW_NODE_MAX_PEERS;
     PeerInfo s_peers[kMaxPeers];
 
     // A peer's sniffed RSSI is only trusted for this long before
@@ -794,4 +794,20 @@ void rtsnowNodeLoop()
 const char *rtsnowNodeFriendlyName()
 {
     return s_friendlyName;
+}
+
+uint8_t rtsnowNodePeers(RTSNowPeerSnapshot *outPeers, uint8_t maxOut)
+{
+    uint8_t count = 0;
+    for (int i = 0; i < kMaxPeers && count < maxOut; i++)
+    {
+        if (!s_peers[i].inUse)
+            continue;
+        outPeers[count].deviceID = s_peers[i].deviceID;
+        memcpy(outPeers[count].mac, s_peers[i].mac, 6);
+        outPeers[count].rssi = s_peers[i].rssi;
+        outPeers[count].lastSeenMs = s_peers[i].lastSeenMs;
+        count++;
+    }
+    return count;
 }

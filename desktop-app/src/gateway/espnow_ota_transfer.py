@@ -107,10 +107,14 @@ class EspNowOtaTransfer(QObject):
     def _arm_retry(self):
         self._attempts += 1
         if self._attempts > self._MAX_RETRIES:
-            timed_out_state = self._state
+            # Covers both a plain timeout (no ack at all) and the node
+            # explicitly rejecting the same chunk every time (see
+            # on_chunk_ack's own comment) - "no response" would be wrong
+            # for the latter, so this message stays neutral about which.
+            gave_up_state = self._state
             self._timer.stop()
             self._state = "done"
-            self.finished.emit(False, f"No response after {self._MAX_RETRIES} attempts (was {timed_out_state})")
+            self.finished.emit(False, f"Gave up after {self._MAX_RETRIES} attempts (was {gave_up_state})")
             return
         self._timer.start(self._RETRY_INTERVAL_MS)
 
@@ -149,10 +153,16 @@ class EspNowOtaTransfer(QObject):
             return
         self._timer.stop()
         if not ok:
-            # The node rejected this exact chunk (e.g. it expected a
-            # different sequence index) - resend it right away rather
-            # than waiting out a full retry interval for nothing.
-            self._attempts = 0
+            # The node rejected this exact chunk - resend right away rather
+            # than waiting out a full retry interval for nothing. Deliberately
+            # NOT resetting _attempts to 0 here (unlike the success path
+            # below): a node that rebooted mid-transfer (losing its
+            # in-memory s_otaActive flag - see rtsnow_node.cpp) rejects
+            # every chunk forever until it gets a fresh espnow_ota_start,
+            # which this class never re-sends on its own. Without counting
+            # these against _MAX_RETRIES too, that situation retried the
+            # same chunk indefinitely in practice (observed live: one
+            # chunk, 11000+ rejections) instead of ever giving up.
             self._send_chunk(self._next_index)
             self._arm_retry()
             return

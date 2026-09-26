@@ -1,11 +1,14 @@
 from typing import Optional
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QCheckBox,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
+    QMenu,
+    QMessageBox,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -61,6 +64,7 @@ class NodeNetworkPage(QWidget):
 
     node_selected = Signal(str)  # mac - user wants to see this device's detail page
     online_only_toggled = Signal(bool)  # lets main_window also filter the RTSNow sidebar children
+    forget_requested = Signal(str)  # mac - user confirmed "Forget Node" from the context menu
 
     def __init__(self):
         super().__init__()
@@ -85,6 +89,8 @@ class NodeNetworkPage(QWidget):
         self.devices_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.devices_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.devices_table.itemDoubleClicked.connect(self._on_device_double_clicked)
+        self.devices_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.devices_table.customContextMenuRequested.connect(self._on_devices_table_context_menu)
         devices_layout.addWidget(self.devices_table)
 
         devices_footer = QHBoxLayout()
@@ -106,6 +112,16 @@ class NodeNetworkPage(QWidget):
 
     def update_devices(self, devices_json: list[dict]):
         self.known_devices = {d["mac"]: KnownDevice.from_json(d) for d in devices_json}
+        self._render_devices_table()
+
+    def remove_device(self, mac: str):
+        """Optimistically drops `mac` from the table the moment a forget is
+        sent, rather than waiting out the up-to-POLL_INTERVAL_MS gap until
+        the next known_devices snapshot confirms it - MainWindow follows
+        this immediately with its own forced re-poll, which reconciles
+        against the gateway's authoritative state (including the device
+        reappearing right away if it's still heartbeating)."""
+        self.known_devices.pop(mac, None)
         self._render_devices_table()
 
     def _render_devices_table(self):
@@ -139,3 +155,25 @@ class NodeNetworkPage(QWidget):
         # column inserted at index 2 (see DEVICE_COLUMNS).
         mac = self.devices_table.item(item.row(), 4).text()
         self.node_selected.emit(mac)
+
+    def _on_devices_table_context_menu(self, pos):
+        row = self.devices_table.rowAt(pos.y())
+        if row < 0:
+            return
+        self.devices_table.selectRow(row)
+        mac = self.devices_table.item(row, DEVICE_COLUMNS.index("MAC")).text()
+        name = self.devices_table.item(row, DEVICE_COLUMNS.index("Name")).text()
+        menu = QMenu(self)
+        forget_action = QAction("Forget Node", self)
+        forget_action.triggered.connect(lambda: self._on_forget_node(mac, name))
+        menu.addAction(forget_action)
+        menu.exec(self.devices_table.viewport().mapToGlobal(pos))
+
+    def _on_forget_node(self, mac: str, name: str):
+        if QMessageBox.question(
+            self, "Forget node",
+            f"Forget {name} ({mac})? It'll reappear here if it announces or "
+            "heartbeats again - this only clears the gateway's known-devices entry."
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        self.forget_requested.emit(mac)

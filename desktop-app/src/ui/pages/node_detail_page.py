@@ -457,12 +457,16 @@ class NodeDetailPage(QWidget):
         self.placeholder_label.setVisible(False)
         self.identity_box.setVisible(True)
         # The Equipment/Model/SPI Address/Baud Rate section only makes
-        # sense for SPI-IM/RTSNow nodes - a different project reached via
-        # the Dashboard's device table (e.g. PolymerPak's solar tracker,
-        # see POLYMERPAK_FIELDS) gets its own Configuration box instead.
-        # Anything that isn't recognized shows neither, rather than
-        # guessing.
-        self.config_box.setVisible(dev.project_name == "RTSNow")
+        # sense for SPI-IM/RTSNow nodes with actual RS-485 equipment
+        # attached - a different project reached via the Dashboard's
+        # device table (e.g. PolymerPak's solar tracker, see
+        # POLYMERPAK_FIELDS) gets its own Configuration box instead, and
+        # the RTS-NOW mesh gateway itself (EthernetGateway - see
+        # main_atom_node.cpp's own comment: no RS-485 transceiver wired to
+        # anything on that board at all) has no equipment configuration of
+        # its own to show either. Anything unrecognized shows neither,
+        # rather than guessing.
+        self.config_box.setVisible(dev.project_name == "RTSNow" and dev.device_type_name != "EthernetGateway")
         self.polymerpak_config_box.setVisible(dev.project_name == "PolymerPak")
         self.remote_box.setVisible(True)
         self.ota_box.setVisible(True)

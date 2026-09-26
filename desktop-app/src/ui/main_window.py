@@ -349,6 +349,7 @@ class MainWindow(QMainWindow):
         self.node_network_page = self.dashboard_page.node_network
         self.node_network_page.node_selected.connect(self._on_node_selected)
         self.node_network_page.online_only_toggled.connect(lambda _checked: self._rebuild_all_project_children())
+        self.node_network_page.forget_requested.connect(self._on_forget_requested)
 
         self.node_detail_page = NodeDetailPage()
         self.node_detail_page.rename_requested.connect(self._on_rename_requested)
@@ -661,6 +662,22 @@ class MainWindow(QMainWindow):
         # reboots will show back up via its own next device_announced/
         # heartbeat, same as any node coming back online.
         self._send({"cmd": "reboot", "mac": mac}, f"reboot {mac}")
+
+    def _on_forget_requested(self, mac: str):
+        # Unlike reboot/rename above, this is a gateway-local command - it
+        # only clears the gateway's own known_devices entry, nothing is
+        # sent over ESP-NOW to the node itself. It'll simply reappear here
+        # on its next announce/heartbeat, same as gateway-firmware's own
+        # `forget` console command says.
+        self._send({"cmd": "forget", "mac": mac}, f"forget {mac}")
+        # Drop it from the table immediately rather than waiting out the
+        # up-to-POLL_INTERVAL_MS gap until the next scheduled snapshot, then
+        # force an early re-poll so the gateway's authoritative state (the
+        # device reappearing right away if it's still heartbeating) shows
+        # up within one round trip instead of up to POLL_INTERVAL_MS later.
+        self.known_devices.pop(mac, None)
+        self.node_network_page.remove_device(mac)
+        self._poll_gateway()
 
     def _on_poll_registers_requested(self, mac: str):
         self._send({"cmd": "poll_registers", "mac": mac}, f"poll_registers {mac}")

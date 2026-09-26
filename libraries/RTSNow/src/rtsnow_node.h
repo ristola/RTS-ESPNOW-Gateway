@@ -120,3 +120,41 @@ void rtsnowNodeLoop();
 // The node's current friendlyName (post-rename, if any) - lets a host
 // project display it on its own UI/logs without keeping a second copy.
 const char *rtsnowNodeFriendlyName();
+
+// Public ceiling on how many peers rtsnowNodePeers() can ever report -
+// rtsnow_node.cpp's own internal peer table size is defined as this
+// constant, not a separate number, so the two can never drift apart.
+// Generous vs. RTSNOW_MAX_NEIGHBORS (the wire-format heartbeat's own,
+// much smaller cap - see rtsnow_protocol.h) since a caller here isn't
+// limited by one ESP-NOW frame's payload budget.
+constexpr uint8_t RTSNOW_NODE_MAX_PEERS = 16;
+
+// One peer this node currently has any discovery data for - unlike
+// RTSNOW_NeighborInfo (the wire-format heartbeat's own neighbor entry,
+// deviceID+rssi only), this includes the MAC: a raw deviceID means
+// nothing to a human looking at a status page, a MAC is what they
+// actually recognize. rssi/lastSeenMs stay at RTSNOW_RSSI_UNKNOWN/0 until
+// this node's WiFi-promiscuous RSSI tap has actually heard this peer at
+// least once.
+struct RTSNowPeerSnapshot
+{
+    uint32_t deviceID = 0;
+    uint8_t mac[6] = {0};
+    int8_t rssi = RTSNOW_RSSI_UNKNOWN;
+    uint32_t lastSeenMs = 0; // millis() timestamp; meaningless (0) while rssi == RTSNOW_RSSI_UNKNOWN
+};
+
+// Snapshots this node's current neighbor-discovery table for a host
+// project's own read-only diagnostics (e.g. a status page) - deliberately
+// NOT the same view this file's own buildNeighborList() computes for the
+// wire-format heartbeat: that one drops any peer whose sniffed RSSI is
+// unknown or older than its own staleness window, since the gateway's
+// routing math has no use for a reading it can't trust as current. A
+// status page is a different consumer with a different need - it can
+// reasonably want to show a neighbor's last known RSSI, labeled with its
+// own age, even if a few minutes stale, rather than have the neighbor
+// just vanish. So this function applies no staleness or RSSI-known
+// filtering at all; every in-use table entry is reported as-is, staleness
+// left entirely as the caller's own display decision. Fills outPeers
+// (capacity maxOut) and returns the count actually written.
+uint8_t rtsnowNodePeers(RTSNowPeerSnapshot *outPeers, uint8_t maxOut);
