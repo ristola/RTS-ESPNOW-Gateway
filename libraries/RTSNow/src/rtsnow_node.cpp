@@ -13,6 +13,7 @@
 
 #include <Arduino.h>
 #include <Preferences.h>
+#include <Update.h>
 #include <WiFi.h>
 #include <cstring>
 #include <esp_now.h>
@@ -52,6 +53,50 @@ namespace
 
     bool s_pendingRegisterRequest = false;
     uint8_t s_pendingRegisterRequestMac[6];
+
+    // ---- Firmware update over ESP-NOW (see RTSNOW_OTA_START's own
+    // comment in rtsnow_protocol.h) ----
+    //
+    // One transfer at a time, matching there being exactly one OTA flash
+    // partition to write - no need for anything more elaborate. Same
+    // "flag in the callback, act in loop()" discipline as everything else
+    // in this file: Update.write()/.begin()/.end() all touch flash, which
+    // stays out of the ESP-NOW receive callback's own task context on
+    // principle, same as every other real work in this file.
+    bool s_otaActive = false;         // true between an accepted OTA_START and OTA_END (success or failure)
+    uint32_t s_otaTotalChunks = 0;
+    uint32_t s_otaNextExpectedIndex = 0;
+    uint8_t s_otaPeerMac[6];          // physical mac to send OTA_START_ACK to - set from s_pendingOtaStartMac; chunk/end acks use their own freshly-captured mac instead (see below)
+
+    // Every ack needs BOTH of these, not just the physical mac: the mac
+    // is who to physically unicast to (may be a relay, not the true
+    // originating gateway), while requesterId is the true originator's
+    // own deviceID, set as the ack's destinationID (see sendTo's own
+    // comment) so a relay's existing generic destinationID-based
+    // forwarding routes the reply all the way back to the gateway even
+    // though it was physically sent to the relay. Captured fresh from
+    // each received message's own header.sourceID/physical mac, not
+    // assumed constant across a transfer, even though in practice a
+    // single transfer's requester/relay choice doesn't change mid-flight.
+    bool s_otaStartPending = false;
+    RTSNOW_OtaStart s_pendingOtaStart;
+    uint8_t s_pendingOtaStartMac[6];
+    uint32_t s_pendingOtaStartRequesterId = 0xFFFFFFFF;
+
+    // At most one chunk buffered at a time - the sender's own strict
+    // stop-and-wait (see RTSNOW_OtaChunk's comment) means a second chunk
+    // is never sent before the first is acked, so there's nothing to gain
+    // from a deeper queue here.
+    bool s_otaChunkPending = false;
+    RTSNOW_OtaChunk s_pendingOtaChunk;
+    uint8_t s_pendingOtaChunkMac[6];
+    uint32_t s_pendingOtaChunkRequesterId = 0xFFFFFFFF;
+
+    bool s_otaEndPending = false;
+    uint8_t s_pendingOtaEndMac[6];
+    uint32_t s_pendingOtaEndRequesterId = 0xFFFFFFFF;
+
+    bool s_otaAbortPending = false;
 
     uint8_t s_selfMac[6]; // cached once in rtsnowNodeBegin() - see onWifiPromiscuousRx's own-transmission guard
 
@@ -249,7 +294,18 @@ namespace
         esp_now_add_peer(&peer);
     }
 
-    bool sendTo(const uint8_t mac[6], RTSNOW_MessageType type, const void *payload, uint16_t payloadLen)
+    // destinationID defaults to broadcast (0xFFFFFFFF), correct for every
+    // pre-existing call site: the ESP-NOW hardware only ever delivers a
+    // unicast frame to its actual physical destination regardless of this
+    // logical field, so it only needs to be set explicitly when a reply
+    // might have to travel back through a relay - see onEspNowRecv's OTA
+    // ack sends, which pass the original request's own header.sourceID
+    // back here so a relay's existing generic destinationID-based
+    // forwarding (see that function's own comment) can route the reply
+    // to the true originating gateway, not just whoever physically
+    // delivered the request to this node.
+    bool sendTo(const uint8_t mac[6], RTSNOW_MessageType type, const void *payload, uint16_t payloadLen,
+                uint32_t destinationID = 0xFFFFFFFF)
     {
         uint8_t buf[250];
         if (sizeof(RTSNOW_Header) + payloadLen > sizeof(buf))
@@ -259,7 +315,7 @@ namespace
         header.version = 1;
         header.messageType = type;
         header.sourceID = localDeviceId();
-        header.destinationID = 0xFFFFFFFF;
+        header.destinationID = destinationID;
         header.sequence = s_nextSequence++;
         header.payloadLength = payloadLen;
 
@@ -417,6 +473,51 @@ namespace
             return;
         }
 
+        // Firmware update over ESP-NOW (see RTSNOW_OTA_START's own
+        // comment) - every message here just flags + copies the small
+        // fixed-size payload; rtsnowNodeLoop() does the actual
+        // Update.begin()/write()/end() calls, keeping flash access out of
+        // this callback's task context.
+        if (header.messageType == RTSNOW_OTA_START && payloadLen >= static_cast<int>(sizeof(RTSNOW_OtaStart)))
+        {
+            memcpy(&s_pendingOtaStart, payload, sizeof(s_pendingOtaStart));
+            memcpy(s_pendingOtaStartMac, mac, 6);
+            s_pendingOtaStartRequesterId = header.sourceID;
+            s_otaStartPending = true;
+            return;
+        }
+
+        if (header.messageType == RTSNOW_OTA_CHUNK && payloadLen >= static_cast<int>(sizeof(RTSNOW_OtaChunk)))
+        {
+            // Drop (don't buffer/queue) if a previous chunk hasn't been
+            // processed yet - the sender's own strict stop-and-wait means
+            // this should never actually happen, and dropping is exactly
+            // what should happen for a stray duplicate/retransmit that
+            // arrives after this node already moved on.
+            if (!s_otaChunkPending)
+            {
+                memcpy(&s_pendingOtaChunk, payload, sizeof(s_pendingOtaChunk));
+                memcpy(s_pendingOtaChunkMac, mac, 6);
+                s_pendingOtaChunkRequesterId = header.sourceID;
+                s_otaChunkPending = true;
+            }
+            return;
+        }
+
+        if (header.messageType == RTSNOW_OTA_END)
+        {
+            memcpy(s_pendingOtaEndMac, mac, 6);
+            s_pendingOtaEndRequesterId = header.sourceID;
+            s_otaEndPending = true;
+            return;
+        }
+
+        if (header.messageType == RTSNOW_OTA_ABORT)
+        {
+            s_otaAbortPending = true;
+            return;
+        }
+
         if (header.messageType != RTSNOW_SET_SETTING)
             return;
         if (payloadLen < static_cast<int>(sizeof(RTSNOW_SettingPayload)))
@@ -571,6 +672,107 @@ void rtsnowNodeLoop()
         // else: this node has no register table to report - silently not
         // answered, same as an RTSNOW_SET_SETTING key this node doesn't
         // recognize.
+    }
+
+    // Firmware update over ESP-NOW (see RTSNOW_OTA_START's own comment).
+    // Serviced before the plain reboot below since OTA_END's own success
+    // path also restarts - if both happened to be pending in the same
+    // tick, finishing (and rebooting into) an in-progress firmware write
+    // takes priority over an unrelated reboot request.
+    if (s_otaStartPending)
+    {
+        s_otaStartPending = false;
+        memcpy(s_otaPeerMac, s_pendingOtaStartMac, 6);
+        if (s_otaActive)
+            Update.abort(); // a fresh START while one was already active - trust the new one, not stale state from whatever the old one was
+        bool began = Update.begin(s_pendingOtaStart.totalSize);
+        if (began)
+        {
+            char md5[33];
+            memcpy(md5, s_pendingOtaStart.md5, sizeof(md5));
+            md5[32] = '\0';
+            if (strlen(md5) == 32) // only trust it if it actually looks like a real MD5 hex string
+                Update.setMD5(md5);
+            s_otaActive = true;
+            s_otaTotalChunks = s_pendingOtaStart.totalChunks;
+            s_otaNextExpectedIndex = 0;
+        }
+        RTSNOW_OtaAck ack{};
+        ack.ok = began ? 1 : 0;
+        if (!began)
+            strncpy(ack.message, "Update.begin failed", sizeof(ack.message) - 1);
+        sendTo(s_otaPeerMac, RTSNOW_OTA_START_ACK, &ack, sizeof(ack), s_pendingOtaStartRequesterId);
+        Serial.printf("RTS-NOW: OTA-over-ESP-NOW start %s (size=%u, %u chunks)\n", began ? "accepted" : "REJECTED",
+                      s_pendingOtaStart.totalSize, s_pendingOtaStart.totalChunks);
+    }
+
+    if (s_otaChunkPending)
+    {
+        s_otaChunkPending = false;
+        uint32_t idx = s_pendingOtaChunk.index;
+        bool ok = false;
+        if (s_otaActive && idx == s_otaNextExpectedIndex)
+        {
+            size_t written = Update.write(s_pendingOtaChunk.data, s_pendingOtaChunk.length);
+            ok = (written == s_pendingOtaChunk.length);
+            if (ok)
+                s_otaNextExpectedIndex++;
+        }
+        // else: no transfer in progress, or this index doesn't match what
+        // comes next (a duplicate retransmit of an already-applied chunk,
+        // or a genuinely out-of-order arrival) - ok stays false either
+        // way, which tells the sender to retry rather than silently
+        // desyncing this node's view of the transfer from the sender's.
+        RTSNOW_OtaChunkAck ack{};
+        ack.index = idx;
+        ack.ok = ok ? 1 : 0;
+        sendTo(s_pendingOtaChunkMac, RTSNOW_OTA_CHUNK_ACK, &ack, sizeof(ack), s_pendingOtaChunkRequesterId);
+    }
+
+    if (s_otaEndPending)
+    {
+        s_otaEndPending = false;
+        RTSNOW_OtaAck ack{};
+        if (s_otaActive && s_otaNextExpectedIndex == s_otaTotalChunks)
+        {
+            bool success = Update.end(true);
+            ack.ok = success ? 1 : 0;
+            if (!success)
+                snprintf(ack.message, sizeof(ack.message), "Update.end failed: %s", Update.errorString());
+        }
+        else
+        {
+            ack.ok = 0;
+            strncpy(ack.message, "incomplete transfer", sizeof(ack.message) - 1);
+        }
+        sendTo(s_pendingOtaEndMac, RTSNOW_OTA_END_ACK, &ack, sizeof(ack), s_pendingOtaEndRequesterId);
+        if (ack.ok)
+        {
+            Serial.println("RTS-NOW: OTA-over-ESP-NOW complete - restarting");
+            delay(100); // let the ack and this line actually get out before the restart
+            if (s_config.onBeforeReboot != nullptr)
+                s_config.onBeforeReboot();
+            ESP.restart();
+            // ESP.restart() does not return - nothing below this point in
+            // this block ever runs on the success path.
+        }
+        else
+        {
+            Serial.printf("RTS-NOW: OTA-over-ESP-NOW failed: %s\n", ack.message);
+            Update.abort();
+            s_otaActive = false;
+        }
+    }
+
+    if (s_otaAbortPending)
+    {
+        s_otaAbortPending = false;
+        if (s_otaActive)
+        {
+            Update.abort();
+            s_otaActive = false;
+            Serial.println("RTS-NOW: OTA-over-ESP-NOW aborted");
+        }
     }
 
     if (s_pendingReboot)

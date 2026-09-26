@@ -43,6 +43,29 @@ enum RTSNOW_MessageType : uint8_t
     RTSNOW_REBOOT = 0x31,             // unicast, gateway -> node: no payload - node restarts shortly after receiving
     RTSNOW_REQUEST_REGISTERS = 0x32,  // unicast, gateway -> node: no payload - "send me your current register block"
     RTSNOW_REGISTER_VALUES = 0x33,    // unicast, node -> gateway: RTSNOW_RegisterBlock
+
+    // Firmware update over ESP-NOW, for a node with no usable WiFi-OTA
+    // path (no IP at all, or a link too unreliable for a sustained TCP
+    // transfer) and no easy physical USB access either. Slow (each chunk
+    // is a full request/ack round trip, driven and retried by the
+    // desktop app - see RTS-ESPNOW-Gateway's own docs) but safe: the
+    // receiving node writes through ESP32's own Update library
+    // (identical to what ArduinoOTA itself uses under the hood) with an
+    // expected MD5 set before the first byte is written, so a failed or
+    // interrupted transfer is simply never marked bootable - the
+    // device's current firmware keeps running untouched, same
+    // dual-OTA-partition safety as any other ESP32 update path. Reuses
+    // this same protocol's destinationID-based single-hop relay (see
+    // that field's own comment) transparently - a chunk addressed to a
+    // node that isn't directly reachable can be routed through another
+    // known device exactly like RTSNOW_SET_SETTING already is.
+    RTSNOW_OTA_START = 0x40,     // gateway -> node: RTSNOW_OtaStart
+    RTSNOW_OTA_START_ACK = 0x41, // node -> gateway: RTSNOW_OtaAck
+    RTSNOW_OTA_CHUNK = 0x42,     // gateway -> node: RTSNOW_OtaChunk
+    RTSNOW_OTA_CHUNK_ACK = 0x43, // node -> gateway: RTSNOW_OtaChunkAck
+    RTSNOW_OTA_END = 0x44,       // gateway -> node: no payload - "that was every chunk, verify and apply"
+    RTSNOW_OTA_END_ACK = 0x45,   // node -> gateway: RTSNOW_OtaAck - node reboots itself right after sending this, if ok
+    RTSNOW_OTA_ABORT = 0x46,     // either direction: no payload - cancel an in-progress transfer
 };
 
 // A node that doesn't yet have Wi-Fi credentials sweeps this channel
@@ -271,5 +294,62 @@ struct RTSNOW_RegisterBlock
     uint16_t startRegister;  // first register number this block covers, e.g. 40001
     uint16_t registerCount;  // how many of `values` are valid, <= 64
     uint16_t values[64];
+};
+#pragma pack(pop)
+
+// ---- Firmware update over ESP-NOW - see RTSNOW_OTA_START's own comment ----
+
+// Opens the transfer. totalSize/totalChunks let the receiving node
+// pre-validate it has room and know when the last chunk has arrived;
+// md5 (32 lowercase hex chars + null terminator, matching what
+// Update::setMD5() expects verbatim) is checked by Update.end() itself
+// after every chunk is written, so a corrupted transfer is caught by the
+// same trusted mechanism ArduinoOTA already relies on rather than a
+// bespoke checksum.
+#pragma pack(push, 1)
+struct RTSNOW_OtaStart
+{
+    uint32_t totalSize;
+    uint32_t totalChunks;
+    char md5[33];
+};
+#pragma pack(pop)
+
+// One piece of the firmware image. Sent and acknowledged one at a time
+// (strict stop-and-wait, driven and retried entirely by the sender - see
+// RTS-ESPNOW-Gateway's desktop app) rather than any kind of sliding
+// window: Update::write() must be called in strict sequential order, and
+// ESP-NOW's real-world loss/reordering rate (confirmed repeatedly on
+// real hardware elsewhere in this protocol's own history) makes
+// reordering-tolerant buffering more complexity than it's worth for a
+// transfer that's already expected to be slow. data[220] keeps the
+// whole struct, plus RTSNOW_Header, comfortably under ESP-NOW's 250-byte
+// total frame cap (14 + 4 + 2 + 220 = 240).
+#pragma pack(push, 1)
+struct RTSNOW_OtaChunk
+{
+    uint32_t index;    // 0-based; the receiver only accepts this if it equals the next expected index
+    uint16_t length;   // valid bytes in data[] - less than sizeof(data) for the final chunk
+    uint8_t data[220];
+};
+#pragma pack(pop)
+
+#pragma pack(push, 1)
+struct RTSNOW_OtaChunkAck
+{
+    uint32_t index;
+    uint8_t ok; // 0 if this exact index wasn't accepted (wrong sequence, no transfer in progress, or the flash write itself failed) - the sender retries the same chunk
+};
+#pragma pack(pop)
+
+// Reply to both RTSNOW_OTA_START (did Update.begin() succeed) and
+// RTSNOW_OTA_END (did the complete image verify and get marked
+// bootable) - same shape for both since both are just "did the thing
+// you asked for work, and if not, why."
+#pragma pack(push, 1)
+struct RTSNOW_OtaAck
+{
+    uint8_t ok;
+    char message[32]; // short human-readable reason on failure; empty on success
 };
 #pragma pack(pop)

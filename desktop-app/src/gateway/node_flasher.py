@@ -76,6 +76,58 @@ class ChipMacReader(QThread):
         self.result.emit(self._port, match.group(1).upper() if match else None)
 
 
+class PioBuildClient(QThread):
+    """Runs a plain `pio run -e <env>` (build only, no `-t upload`, no
+    port involved at all) - used by the ESP-NOW flash flow, which needs a
+    fresh .bin to stream over the mesh rather than a USB target to push
+    it to directly. Deliberately a separate, smaller class from
+    NodeFlasherClient above rather than a shared one with an optional
+    upload step - the two have different progress semantics entirely
+    (esptool's own "(NN %)" write progress vs. nothing meaningful to
+    report during a compile) and conflating them risked a half-upload
+    code path this flow never actually uses.
+    """
+
+    log_line = Signal(str)
+    finished = Signal(bool, str, str)  # ok, message, path to the built firmware.bin (empty on failure)
+
+    def __init__(self, project_dir: str, environment: str):
+        super().__init__()
+        self._project_dir = project_dir
+        self._environment = environment
+
+    def run(self):
+        pio = find_pio()
+        if pio is None:
+            self.finished.emit(False, "Could not find the `pio` CLI - is PlatformIO installed?", "")
+            return
+
+        cmd = [pio, "run", "-e", self._environment]
+        try:
+            proc = subprocess.Popen(
+                cmd, cwd=self._project_dir,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1,
+            )
+        except OSError as exc:
+            self.finished.emit(False, f"Could not start pio: {exc}", "")
+            return
+
+        for line in proc.stdout:
+            self.log_line.emit(line.rstrip("\n"))
+
+        proc.wait()
+        if proc.returncode != 0:
+            self.finished.emit(False, f"Build failed - pio exited with code {proc.returncode}, see log", "")
+            return
+
+        bin_path = os.path.join(self._project_dir, ".pio", "build", self._environment, "firmware.bin")
+        if not os.path.isfile(bin_path):
+            self.finished.emit(False, f"Build succeeded but {bin_path} wasn't found", "")
+            return
+        self.finished.emit(True, "Build succeeded", bin_path)
+
+
 class NodeFlasherClient(QThread):
     """Runs `pio run -t upload` against a PlatformIO project, targeting one
     serial port - used to flash RTS-NOW node firmware onto a newly

@@ -22,13 +22,15 @@ from PySide6.QtWidgets import (
 )
 
 from src.gateway.device_info_client import DeviceInfoFetcher
+from src.gateway.espnow_ota_transfer import EspNowOtaTransfer
 from src.gateway.models import KnownDevice
-from src.gateway.node_flasher import ChipMacReader, NodeFlasherClient
+from src.gateway.node_flasher import ChipMacReader, NodeFlasherClient, PioBuildClient
 from src.gateway.ota_client import OtaPushClient
 from src.gateway.ports import list_serial_ports
 from src.gateway.serial_client import GatewayClient
 from src.ui.pages.dashboard_page import DashboardPage
 from src.ui.pages.dryer_detail_page import DryerDetailPage
+from src.ui.pages.espnow_flash_page import EspNowFlashPage
 from src.ui.pages.flash_node_page import FlashNodePage
 from src.ui.pages.mesh_page import MeshPage
 from src.ui.pages.node_detail_page import NodeDetailPage
@@ -71,6 +73,8 @@ class MainWindow(QMainWindow):
         self._ota_target_page = None  # whichever page's ota_requested started the in-flight push
         self._verified = False  # confirmed the connected port is actually an RTS ESP-NOW Gateway
         self._node_flasher: NodeFlasherClient | None = None
+        self._pio_build_client: PioBuildClient | None = None
+        self._espnow_ota_transfer: EspNowOtaTransfer | None = None
         self._mac_readers: list[ChipMacReader] = []
         self._scan_results: list[dict] = []
         self._scan_pending_ports: list[tuple[str, str]] = []  # (port, description) still to read
@@ -219,6 +223,7 @@ class MainWindow(QMainWindow):
         self._add_nav_item(sidebar, "Hardware List", ("dashboard", None))
         self._add_nav_item(sidebar, self._RTSNOW_CHILD_INDENT + "Flash Node", ("flash_node", None))
         self._add_nav_item(sidebar, self._RTSNOW_CHILD_INDENT + "Mesh", ("mesh", None))
+        self._add_nav_item(sidebar, self._RTSNOW_CHILD_INDENT + "ESP-NOW Flash", ("espnow_flash", None))
         separator = self._add_nav_item(sidebar, "", ("separator", None))
         separator.setFlags(Qt.ItemFlag.NoItemFlags)  # blank spacer row - not selectable/clickable
         self._add_nav_item(sidebar, "RTSNow", ("rtsnow", None))
@@ -380,6 +385,11 @@ class MainWindow(QMainWindow):
         self.mesh_page = MeshPage()
         self.pages.addWidget(self.mesh_page)
 
+        self.espnow_flash_page = EspNowFlashPage()
+        self.espnow_flash_page.flash_requested.connect(self._on_espnow_flash_requested)
+        self.espnow_flash_page.abort_requested.connect(self._on_espnow_flash_abort_requested)
+        self.pages.addWidget(self.espnow_flash_page)
+
         return self.pages
 
     def _build_log_panel(self) -> QWidget:
@@ -408,6 +418,8 @@ class MainWindow(QMainWindow):
             self.pages.setCurrentWidget(self.flash_node_page)
         elif role == "mesh":
             self.pages.setCurrentWidget(self.mesh_page)
+        elif role == "espnow_flash":
+            self.pages.setCurrentWidget(self.espnow_flash_page)
         elif role == "device":
             dev = self.known_devices.get(payload)
             if dev is not None:
@@ -754,6 +766,40 @@ class MainWindow(QMainWindow):
         self._log(("Node flash succeeded: " if success else "Node flash FAILED: ") + message)
         self._node_flasher = None
 
+    def _on_espnow_flash_requested(self, mac: str, project_dir: str, environment: str):
+        if self._pio_build_client is not None or self._espnow_ota_transfer is not None:
+            QMessageBox.warning(self, "Flash in progress", "Wait for the current ESP-NOW flash to finish first.")
+            return
+        self._log(f"-> Building {project_dir} (env: {environment}) for ESP-NOW flash to {mac}")
+        self._pio_build_client = PioBuildClient(project_dir, environment)
+        self._pio_build_client.log_line.connect(self.espnow_flash_page.append_log)
+        self._pio_build_client.finished.connect(
+            lambda ok, message, bin_path: self._on_espnow_build_finished(mac, ok, message, bin_path)
+        )
+        self._pio_build_client.start()
+
+    def _on_espnow_build_finished(self, mac: str, ok: bool, message: str, bin_path: str):
+        self._pio_build_client = None
+        if not ok:
+            self.espnow_flash_page.set_result(False, message)
+            return
+        self.espnow_flash_page.append_log(f"Build succeeded: {bin_path}")
+        self._espnow_ota_transfer = EspNowOtaTransfer(self._send, mac, bin_path)
+        self._espnow_ota_transfer.progress.connect(self.espnow_flash_page.set_progress)
+        self._espnow_ota_transfer.log.connect(self.espnow_flash_page.append_log)
+        self._espnow_ota_transfer.finished.connect(self._on_espnow_ota_finished)
+        self._espnow_ota_transfer.start()
+
+    def _on_espnow_ota_finished(self, success: bool, message: str):
+        self.espnow_flash_page.set_result(success, message)
+        self._log(("ESP-NOW flash succeeded: " if success else "ESP-NOW flash FAILED: ") + message)
+        self._espnow_ota_transfer = None
+
+    def _on_espnow_flash_abort_requested(self):
+        if self._espnow_ota_transfer is not None:
+            self._espnow_ota_transfer.abort()
+            self._espnow_ota_transfer = None
+
     # ---- Incoming events ----
 
     def _on_event_received(self, obj: dict):
@@ -822,6 +868,15 @@ class MainWindow(QMainWindow):
             self._log(f"Received {len(values)} register(s) from {mac} starting at {start_register}.")
             if self.node_detail_page.current_mac() == mac:
                 self.node_detail_page.show_register_values(start_register, values)
+        elif event == "espnow_ota_start_ack":
+            if self._espnow_ota_transfer is not None:
+                self._espnow_ota_transfer.on_start_ack(obj.get("mac"), bool(obj.get("ok")), obj.get("message", ""))
+        elif event == "espnow_ota_chunk_ack":
+            if self._espnow_ota_transfer is not None:
+                self._espnow_ota_transfer.on_chunk_ack(obj.get("mac"), obj.get("index", -1), bool(obj.get("ok")))
+        elif event == "espnow_ota_end_ack":
+            if self._espnow_ota_transfer is not None:
+                self._espnow_ota_transfer.on_end_ack(obj.get("mac"), bool(obj.get("ok")), obj.get("message", ""))
         elif event == "channel_changed":
             channel = obj.get("channel", RTSNOW_CHANNEL_MIN)
             self.channel_spin.blockSignals(True)
@@ -844,6 +899,7 @@ class MainWindow(QMainWindow):
         self.known_devices = {d["mac"]: KnownDevice.from_json(d) for d in devices_json}
         self.node_network_page.update_devices(devices_json)
         self.mesh_page.update_devices(list(self.known_devices.values()))
+        self.espnow_flash_page.update_devices(list(self.known_devices.values()))
         self._rebuild_all_project_children()
 
         rtsnow_devices = [dev for dev in self.known_devices.values() if dev.project_name == "RTSNow"]

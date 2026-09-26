@@ -488,6 +488,23 @@ namespace
         return -1;
     }
 
+    // Resolves the MAC string to report for an incoming message's TRUE
+    // origin (header.sourceID), not the physical sender - those differ
+    // whenever the message was relayed (see rtsnow_node.cpp's single-hop
+    // forwarding), and reporting the relay's own MAC instead of the real
+    // originator's would misattribute the event to the wrong device -
+    // exactly the class of bug already found and fixed once for routing
+    // decisions (see KnownDevice.supportsRelay's own history). Falls back
+    // to the physical `mac` only if this deviceID isn't recognized at
+    // all, which shouldn't normally happen for a device that just sent an
+    // OTA ack (it must have announced/heartbeated to be routable in the
+    // first place).
+    void resolve_true_mac_str(uint32_t sourceDeviceId, const uint8_t physicalMac[6], char *out, size_t outSize)
+    {
+        int idx = find_known_device_by_device_id(sourceDeviceId);
+        mac_to_str(idx >= 0 ? s_known_devices[idx].mac : physicalMac, out, outSize);
+    }
+
     // Require a candidate relay path to beat a direct send by a real
     // margin, not just any positive difference - RSSI naturally jitters
     // a few dB between readings even with nothing physically changing,
@@ -575,6 +592,42 @@ namespace
             return;
         s_last_routing_recompute_ms = now;
         recompute_routing();
+    }
+
+    // Broadcasts this gateway's own minimal identity, reusing
+    // RTSNOW_ANNOUNCE/RTSNOW_DeviceIdentity exactly like any regular node
+    // does. Not to make the gateway show up as "a device" in its own
+    // known_devices table - on_espnow_recv's own header.sourceID ==
+    // local_device_id() check already discards this right back out
+    // before that could ever happen, same guard every node's own
+    // onEspNowRecv already has for its own broadcasts too. The actual
+    // reason: every node's existing passive peer-discovery (notePeer() in
+    // rtsnow_node.cpp, already built for node<->node neighbor discovery)
+    // learns the gateway's deviceID<->MAC mapping for free from this, the
+    // same way it already learns any other device's. That's what lets a
+    // relay's existing, symmetric destinationID-based forwarding
+    // correctly route a reply addressed back to the gateway (e.g. an
+    // OTA-over-ESP-NOW chunk ack - see do_ota_*_send) through itself -
+    // without this, no node would ever have a route to "the gateway" at
+    // all, since it's otherwise deliberately silent/announce-less.
+    uint32_t s_last_gateway_announce_ms = 0;
+    constexpr uint32_t kGatewayAnnounceIntervalMs = 10000; // matches rtsnow_node.cpp's own default heartbeatIntervalMs
+
+    void send_gateway_announce_if_due()
+    {
+        uint32_t now = millis();
+        if (now - s_last_gateway_announce_ms < kGatewayAnnounceIntervalMs)
+            return;
+        s_last_gateway_announce_ms = now;
+
+        RTSNOW_DeviceIdentity id{};
+        id.deviceID = local_device_id();
+        strncpy(id.projectName, "RTSNow", sizeof(id.projectName) - 1);
+        strncpy(id.deviceTypeName, "Gateway", sizeof(id.deviceTypeName) - 1);
+        strncpy(id.friendlyName, "Gateway", sizeof(id.friendlyName) - 1);
+        id.firmwareVersionMajor = 1;
+        id.ipv4Address = 0; // this gateway has no IP of its own in the RTS-NOW sense - it's the ESP-NOW side, not a node with its own Modbus/HTTP surface
+        send_broadcast(RTSNOW_ANNOUNCE, &id, sizeof(id));
     }
 
     // Populates one device's fields onto a JsonObject - shared by the
@@ -1055,6 +1108,85 @@ namespace
         return nullptr;
     }
 
+    // ---- Firmware update over ESP-NOW (see RTSNOW_OTA_START's own
+    // comment in rtsnow_protocol.h) ----
+    //
+    // Single-shot sends, deliberately NOT resent here like
+    // do_setting_send/do_reboot_send above - the desktop app drives this
+    // entire transfer command-by-command over the same serial JSON
+    // channel and already needs its own per-chunk ack-wait-and-retry loop
+    // regardless (it must know a chunk succeeded before sending the next
+    // one - strict stop-and-wait, see RTSNOW_OtaChunk's own comment), so
+    // resending here too would just be a second, redundant retry layer
+    // the desktop app can't see or control the timing of.
+    const char *do_ota_start_send(const uint8_t mac[6], const RTSNOW_OtaStart &payload)
+    {
+        int idx = find_known_device_by_mac(mac);
+        if (idx < 0)
+            return "unknown MAC - it must have announced/heartbeated at least once (see `list`)";
+        SendTarget dest = resolve_send_target(idx);
+        ensure_peer(dest.mac);
+        send_to(dest.mac, RTSNOW_OTA_START, &payload, sizeof(payload), dest.destinationID);
+        return nullptr;
+    }
+
+    const char *do_ota_chunk_send(const uint8_t mac[6], const RTSNOW_OtaChunk &payload)
+    {
+        int idx = find_known_device_by_mac(mac);
+        if (idx < 0)
+            return "unknown MAC - it must have announced/heartbeated at least once (see `list`)";
+        SendTarget dest = resolve_send_target(idx);
+        ensure_peer(dest.mac);
+        send_to(dest.mac, RTSNOW_OTA_CHUNK, &payload, sizeof(payload), dest.destinationID);
+        return nullptr;
+    }
+
+    const char *do_ota_end_send(const uint8_t mac[6])
+    {
+        int idx = find_known_device_by_mac(mac);
+        if (idx < 0)
+            return "unknown MAC - it must have announced/heartbeated at least once (see `list`)";
+        SendTarget dest = resolve_send_target(idx);
+        ensure_peer(dest.mac);
+        send_to(dest.mac, RTSNOW_OTA_END, nullptr, 0, dest.destinationID);
+        return nullptr;
+    }
+
+    const char *do_ota_abort_send(const uint8_t mac[6])
+    {
+        int idx = find_known_device_by_mac(mac);
+        if (idx < 0)
+            return "unknown MAC - it must have announced/heartbeated at least once (see `list`)";
+        SendTarget dest = resolve_send_target(idx);
+        ensure_peer(dest.mac);
+        send_to(dest.mac, RTSNOW_OTA_ABORT, nullptr, 0, dest.destinationID);
+        return nullptr;
+    }
+
+    // Decodes a lowercase-or-uppercase hex string (must be an even number
+    // of characters) into raw bytes - used for RTSNOW_OtaChunk.data, sent
+    // over the JSON serial channel as hex rather than base64 since
+    // ArduinoJson has no built-in binary encoding and hex has no
+    // padding/alphabet edge cases to get wrong.
+    bool hex_decode(const char *hex, uint8_t *out, size_t maxOutLen, size_t &outLen)
+    {
+        size_t hexLen = strlen(hex);
+        if (hexLen % 2 != 0)
+            return false;
+        size_t n = hexLen / 2;
+        if (n > maxOutLen)
+            return false;
+        for (size_t i = 0; i < n; i++)
+        {
+            unsigned int byte;
+            if (sscanf(hex + i * 2, "%2x", &byte) != 1)
+                return false;
+            out[i] = static_cast<uint8_t>(byte);
+        }
+        outLen = n;
+        return true;
+    }
+
     void save_channel(uint8_t channel)
     {
         Preferences prefs;
@@ -1454,6 +1586,83 @@ namespace
         send_ack("poll_registers", &doc, error == nullptr, error);
     }
 
+    // ---- Firmware update over ESP-NOW: JSON command handlers ----
+    // The desktop app drives the whole transfer, one of these per wire
+    // message - see do_ota_*_send's own comment for why there's no
+    // resend loop at this layer.
+
+    void handle_espnow_ota_start_command(const JsonDocument &doc)
+    {
+        const char *macStr = doc["mac"] | "";
+        uint8_t mac[6];
+        if (!parse_mac(macStr, mac))
+        {
+            send_ack("espnow_ota_start", &doc, false, "invalid MAC address");
+            return;
+        }
+        const char *md5 = doc["md5"] | "";
+        if (strlen(md5) != 32)
+        {
+            send_ack("espnow_ota_start", &doc, false, "md5 must be exactly 32 hex chars");
+            return;
+        }
+        RTSNOW_OtaStart payload{};
+        payload.totalSize = doc["size"] | 0;
+        payload.totalChunks = doc["totalChunks"] | 0;
+        strncpy(payload.md5, md5, sizeof(payload.md5) - 1);
+        const char *error = do_ota_start_send(mac, payload);
+        send_ack("espnow_ota_start", &doc, error == nullptr, error);
+    }
+
+    void handle_espnow_ota_chunk_command(const JsonDocument &doc)
+    {
+        const char *macStr = doc["mac"] | "";
+        uint8_t mac[6];
+        if (!parse_mac(macStr, mac))
+        {
+            send_ack("espnow_ota_chunk", &doc, false, "invalid MAC address");
+            return;
+        }
+        const char *hex = doc["dataHex"] | "";
+        RTSNOW_OtaChunk payload{};
+        payload.index = doc["index"] | 0;
+        size_t decodedLen = 0;
+        if (!hex_decode(hex, payload.data, sizeof(payload.data), decodedLen))
+        {
+            send_ack("espnow_ota_chunk", &doc, false, "invalid or oversized dataHex");
+            return;
+        }
+        payload.length = static_cast<uint16_t>(decodedLen);
+        const char *error = do_ota_chunk_send(mac, payload);
+        send_ack("espnow_ota_chunk", &doc, error == nullptr, error);
+    }
+
+    void handle_espnow_ota_end_command(const JsonDocument &doc)
+    {
+        const char *macStr = doc["mac"] | "";
+        uint8_t mac[6];
+        if (!parse_mac(macStr, mac))
+        {
+            send_ack("espnow_ota_end", &doc, false, "invalid MAC address");
+            return;
+        }
+        const char *error = do_ota_end_send(mac);
+        send_ack("espnow_ota_end", &doc, error == nullptr, error);
+    }
+
+    void handle_espnow_ota_abort_command(const JsonDocument &doc)
+    {
+        const char *macStr = doc["mac"] | "";
+        uint8_t mac[6];
+        if (!parse_mac(macStr, mac))
+        {
+            send_ack("espnow_ota_abort", &doc, false, "invalid MAC address");
+            return;
+        }
+        const char *error = do_ota_abort_send(mac);
+        send_ack("espnow_ota_abort", &doc, error == nullptr, error);
+    }
+
     void handle_channel_command(const JsonDocument &doc)
     {
         int value = doc["value"] | -1;
@@ -1495,6 +1704,14 @@ namespace
             handle_reboot_command(doc);
         else if (strcmp(cmd, "poll_registers") == 0)
             handle_poll_registers_command(doc);
+        else if (strcmp(cmd, "espnow_ota_start") == 0)
+            handle_espnow_ota_start_command(doc);
+        else if (strcmp(cmd, "espnow_ota_chunk") == 0)
+            handle_espnow_ota_chunk_command(doc);
+        else if (strcmp(cmd, "espnow_ota_end") == 0)
+            handle_espnow_ota_end_command(doc);
+        else if (strcmp(cmd, "espnow_ota_abort") == 0)
+            handle_espnow_ota_abort_command(doc);
         else if (strcmp(cmd, "channel") == 0)
             handle_channel_command(doc);
         else if (strcmp(cmd, "discover") == 0)
@@ -1508,7 +1725,11 @@ namespace
 
     void service_serial()
     {
-        static char lineBuf[192];
+        // Must comfortably fit an espnow_ota_chunk command line: ~80 bytes of
+        // JSON overhead plus CHUNK_SIZE*2 hex chars for the data field
+        // (220*2 = 440) - 192 was fine for every other command but silently
+        // truncated (and lost the framing "\n" of) OTA chunk lines.
+        static char lineBuf[640];
         static size_t lineLen = 0;
 
         while (Serial.available())
@@ -1652,6 +1873,61 @@ namespace
             emit_json(doc); // called from the ESP-NOW callback - see "Deferred Serial output"
             break;
         }
+        case RTSNOW_OTA_START_ACK:
+        {
+            if (payloadLen < static_cast<int>(sizeof(RTSNOW_OtaAck)))
+                return;
+            RTSNOW_OtaAck ack;
+            memcpy(&ack, payload, sizeof(ack));
+            ack.message[sizeof(ack.message) - 1] = '\0';
+            char macStr[18];
+            resolve_true_mac_str(header.sourceID, mac, macStr, sizeof(macStr));
+
+            JsonDocument doc;
+            doc["event"] = "espnow_ota_start_ack";
+            doc["mac"] = macStr;
+            doc["ok"] = static_cast<bool>(ack.ok);
+            if (!ack.ok)
+                doc["message"] = ack.message;
+            emit_json(doc);
+            break;
+        }
+        case RTSNOW_OTA_CHUNK_ACK:
+        {
+            if (payloadLen < static_cast<int>(sizeof(RTSNOW_OtaChunkAck)))
+                return;
+            RTSNOW_OtaChunkAck ack;
+            memcpy(&ack, payload, sizeof(ack));
+            char macStr[18];
+            resolve_true_mac_str(header.sourceID, mac, macStr, sizeof(macStr));
+
+            JsonDocument doc;
+            doc["event"] = "espnow_ota_chunk_ack";
+            doc["mac"] = macStr;
+            doc["index"] = ack.index;
+            doc["ok"] = static_cast<bool>(ack.ok);
+            emit_json(doc);
+            break;
+        }
+        case RTSNOW_OTA_END_ACK:
+        {
+            if (payloadLen < static_cast<int>(sizeof(RTSNOW_OtaAck)))
+                return;
+            RTSNOW_OtaAck ack;
+            memcpy(&ack, payload, sizeof(ack));
+            ack.message[sizeof(ack.message) - 1] = '\0';
+            char macStr[18];
+            resolve_true_mac_str(header.sourceID, mac, macStr, sizeof(macStr));
+
+            JsonDocument doc;
+            doc["event"] = "espnow_ota_end_ack";
+            doc["mac"] = macStr;
+            doc["ok"] = static_cast<bool>(ack.ok);
+            if (!ack.ok)
+                doc["message"] = ack.message;
+            emit_json(doc);
+            break;
+        }
         default:
             break; // not yet handled by this gateway
         }
@@ -1754,6 +2030,11 @@ namespace
 
 void setup()
 {
+    // Must be called before begin() - default (256B) is smaller than a
+    // single espnow_ota_chunk command line (~520B), risking silent RX
+    // overflow if loop() is busy (e.g. mid ESP-NOW relay) when a chunk
+    // line arrives.
+    Serial.setRxBufferSize(1024);
     Serial.begin(115200);
 
     s_led.begin();
@@ -1824,6 +2105,7 @@ void loop()
     expire_pending();
     expire_awaiting_confirm();
     recompute_routing_if_due();
+    send_gateway_announce_if_due();
     drain_output_queue();
     update_led();
     delay(20);
