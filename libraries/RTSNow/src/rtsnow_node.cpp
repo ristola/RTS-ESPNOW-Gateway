@@ -16,6 +16,7 @@
 #include <WiFi.h>
 #include <cstring>
 #include <esp_now.h>
+#include <esp_wifi.h>
 
 #include "rtsnow_protocol.h"
 
@@ -51,6 +52,182 @@ namespace
 
     bool s_pendingRegisterRequest = false;
     uint8_t s_pendingRegisterRequestMac[6];
+
+    uint8_t s_selfMac[6]; // cached once in rtsnowNodeBegin() - see onWifiPromiscuousRx's own-transmission guard
+
+    // Single-hop relay forwarding (see onEspNowRecv's destinationID check
+    // and gateway-firmware's recompute_routing() for how a node ends up
+    // being asked to do this at all). Queued here and actually resent
+    // from rtsnowNodeLoop(), NOT sent directly from onEspNowRecv - same
+    // "flag in the callback, act in loop()" discipline as
+    // s_pendingReboot/s_pendingSettingAck above, and for an added reason
+    // specific to relaying: a single-shot forward was confirmed on real
+    // hardware to have a real chance of silently failing, precisely
+    // because a node only ever gets CHOSEN as a relay for a target whose
+    // link is marginal even to it (that's the entire premise - a relay's
+    // own link to the final target isn't necessarily strong just because
+    // its link to the gateway is). Resending a few times, a beat apart,
+    // is the exact same reliability fix gateway-firmware's own
+    // kRemoteControlResendCount already applies to its direct sends.
+    struct PendingRelay
+    {
+        bool inUse = false;
+        uint8_t targetMac[6];
+        uint8_t attemptsRemaining = 0;
+        uint32_t nextAttemptMs = 0;
+        uint8_t buf[250];
+        int len = 0;
+    };
+    constexpr int kMaxPendingRelays = 2; // relaying is the exception, not the common case - this node is usually either the gateway's direct target or not involved at all
+    PendingRelay s_pendingRelays[kMaxPendingRelays];
+    constexpr uint8_t kRelayResendCount = 3;
+    constexpr uint32_t kRelayResendGapMs = 40;
+
+    // ---- Neighbor discovery (also feeds gateway-firmware's own
+    // recompute_routing(), see RTSNOW_Heartbeat's own neighbors/
+    // neighborCount comment) ----
+    //
+    // deviceID<->MAC comes from other nodes' own RTSNOW_ANNOUNCE/
+    // RTSNOW_HEARTBEAT broadcasts (already reaching every device in
+    // range, same as they already reach the gateway - ESP-NOW broadcasts
+    // aren't gateway-exclusive), learned passively in onEspNowRecv below.
+    // rssi/lastSeenMs come from a completely separate source,
+    // onWifiPromiscuousRx: the normal esp_now_register_recv_cb callback
+    // (used for onEspNowRecv itself) never gets radio metadata on this
+    // SDK - only a WiFi promiscuous-mode tap does (identical reasoning,
+    // and identical technique, to gateway-firmware's own
+    // on_wifi_promiscuous_rx). A peer only ever gets reported as a
+    // neighbor (see buildNeighborList) once both halves are known: its
+    // identity (from an announce/heartbeat) AND a recent sniffed RSSI
+    // (from the promiscuous tap) - one alone isn't enough to say "I can
+    // hear this device."
+    struct PeerInfo
+    {
+        uint32_t deviceID = 0;
+        uint8_t mac[6] = {0};
+        int8_t rssi = RTSNOW_RSSI_UNKNOWN;
+        uint32_t lastSeenMs = 0;
+        bool inUse = false;
+    };
+    // Generous vs. RTSNOW_MAX_NEIGHBORS (the wire limit on how many get
+    // reported per heartbeat) - this table can track more peers than fit
+    // in one heartbeat; buildNeighborList only reports the freshest ones
+    // if it's ever actually full enough for that distinction to matter.
+    constexpr uint8_t kMaxPeers = 16;
+    PeerInfo s_peers[kMaxPeers];
+
+    // A peer's sniffed RSSI is only trusted for this long before
+    // buildNeighborList stops reporting it at all - a few heartbeat
+    // intervals' worth, so a neighbor that's gone truly quiet drops off
+    // the list instead of showing a frozen, possibly long-stale reading
+    // forever.
+    constexpr uint32_t kPeerStaleMs = 60000;
+
+    // Learns/refreshes a peer's deviceID<->MAC mapping - called from
+    // onEspNowRecv for every RTSNOW_ANNOUNCE/RTSNOW_HEARTBEAT this node
+    // overhears from another node. Deliberately does NOT touch
+    // rssi/lastSeenMs - those only ever come from onWifiPromiscuousRx,
+    // never from this (RSSI-blind) callback.
+    void notePeer(uint32_t deviceID, const uint8_t mac[6])
+    {
+        for (int i = 0; i < kMaxPeers; i++)
+        {
+            if (s_peers[i].inUse && s_peers[i].deviceID == deviceID)
+            {
+                memcpy(s_peers[i].mac, mac, 6);
+                return;
+            }
+        }
+        for (int i = 0; i < kMaxPeers; i++)
+        {
+            if (!s_peers[i].inUse)
+            {
+                s_peers[i] = PeerInfo{};
+                s_peers[i].inUse = true;
+                s_peers[i].deviceID = deviceID;
+                memcpy(s_peers[i].mac, mac, 6);
+                return;
+            }
+        }
+        // Table genuinely full - silently drop. kMaxPeers is generous for
+        // any realistic deployment of this project; losing the ability to
+        // track one more peer's neighbor-diagnostic data isn't worth the
+        // complexity of eviction logic for a case this unlikely.
+    }
+
+    // See this whole section's own comment above for why this needs a
+    // separate WiFi promiscuous callback rather than getting RSSI off the
+    // normal ESP-NOW receive callback. Runs in the WiFi driver's own task
+    // context, same discipline as onEspNowRecv - a MAC comparison against
+    // the peer table plus one int8_t/uint32_t write, deliberately kept
+    // that cheap.
+    void onWifiPromiscuousRx(void *buf, wifi_promiscuous_pkt_type_t type)
+    {
+        if (type != WIFI_PKT_MGMT)
+            return;
+
+        const wifi_promiscuous_pkt_t *pkt = reinterpret_cast<const wifi_promiscuous_pkt_t *>(buf);
+        const uint8_t *frame = pkt->payload;
+        int frameLen = pkt->rx_ctrl.sig_len;
+
+        // 802.11 MAC header: frame control(2) + duration(2) + addr1(6) +
+        // addr2(6) + addr3(6) + seq control(2) = 24 bytes, then the Action
+        // frame body starts with category(1) + OUI(3).
+        constexpr int kMacHeaderLen = 24;
+        if (frameLen < kMacHeaderLen + 4)
+            return;
+
+        const uint8_t *body = frame + kMacHeaderLen;
+        constexpr uint8_t kVendorSpecificCategory = 0x7F;
+        constexpr uint8_t kEspressifOui[3] = {0x18, 0xFE, 0x34};
+        if (body[0] != kVendorSpecificCategory || memcmp(body + 1, kEspressifOui, 3) != 0)
+            return;
+
+        const uint8_t *sourceMac = frame + 10; // addr2 = transmitter
+        if (memcmp(sourceMac, s_selfMac, 6) == 0)
+            return; // our own transmission - shouldn't normally loop back, cheap to guard anyway
+
+        for (int i = 0; i < kMaxPeers; i++)
+        {
+            if (s_peers[i].inUse && memcmp(s_peers[i].mac, sourceMac, 6) == 0)
+            {
+                s_peers[i].rssi = pkt->rx_ctrl.rssi;
+                s_peers[i].lastSeenMs = millis();
+                return;
+            }
+        }
+        // Unknown MAC - either the gateway itself (which never sends its
+        // own announce/heartbeat, so it's never in this table - correct,
+        // this is node<->node discovery, not node<->gateway, which
+        // wifiRssi/the gateway's own espNowRssi capture already cover)
+        // or just a peer whose announce/heartbeat hasn't arrived yet.
+        // Nothing to attribute this reading to until one does.
+    }
+
+    // Fills outNeighbors (capacity maxOut) with this node's current view
+    // of nearby peers - see this section's own top comment for what
+    // "current" requires (both a known identity AND a recent sniffed
+    // RSSI). Called fresh from rtsnowNodeLoop() every heartbeat, not
+    // cached, so a neighbor that drops off (or newly appears) is
+    // reflected within one heartbeat interval.
+    uint8_t buildNeighborList(RTSNOW_NeighborInfo *outNeighbors, uint8_t maxOut)
+    {
+        uint8_t count = 0;
+        uint32_t now = millis();
+        for (int i = 0; i < kMaxPeers && count < maxOut; i++)
+        {
+            if (!s_peers[i].inUse)
+                continue;
+            if (s_peers[i].rssi == RTSNOW_RSSI_UNKNOWN)
+                continue;
+            if (now - s_peers[i].lastSeenMs > kPeerStaleMs)
+                continue;
+            outNeighbors[count].deviceID = s_peers[i].deviceID;
+            outNeighbors[count].rssi = s_peers[i].rssi;
+            count++;
+        }
+        return count;
+    }
 
     uint32_t localDeviceId()
     {
@@ -147,8 +324,85 @@ namespace
         if (header.version != 1 || header.sourceID == localDeviceId())
             return;
 
+        // Single-hop relay (see rtsnow_protocol.h's destinationID comment
+        // and gateway-firmware's recompute_routing()): the ONLY way this
+        // node ever sees a frame addressed to someone else at all is that
+        // the gateway explicitly unicast it to THIS node's own MAC,
+        // having decided this node has a better path to the real target
+        // than the gateway does directly - the ESP-NOW hardware itself
+        // never delivers a unicast frame to any device except its actual
+        // physical destination, so there's no risk of every node trying
+        // to relay every frame it wasn't literally addressed to receive
+        // in the first place. RTSNOW_ANNOUNCE/RTSNOW_HEARTBEAT broadcasts
+        // (destinationID always 0xFFFFFFFF) are never affected by this -
+        // this block only ever fires for a frame explicitly addressed
+        // (by deviceID) to some OTHER specific device.
+        //
+        // Raw re-transmit: header and payload bytes both go out completely
+        // unchanged, just to a different physical next-hop MAC - so
+        // header.sourceID (who this is really from) and header.destinationID
+        // (who it's really for) both stay intact for the real endpoints to
+        // make sense of, and this node needs no awareness of message types
+        // it doesn't otherwise handle. Exactly one hop: the real target's
+        // own destinationID check below matches its own deviceID, so it
+        // processes the frame normally rather than relaying it any
+        // further - there is no path by which this can cascade or loop.
+        //
+        // Queued into s_pendingRelays rather than sent here directly -
+        // see that struct's own comment for why (resend-for-reliability
+        // needs delay()-style spacing, which does not belong inside this
+        // callback's task context).
+        if (header.destinationID != 0xFFFFFFFF && header.destinationID != localDeviceId())
+        {
+            if (static_cast<size_t>(len) <= sizeof(PendingRelay::buf))
+            {
+                for (int i = 0; i < kMaxPeers; i++)
+                {
+                    if (s_peers[i].inUse && s_peers[i].deviceID == header.destinationID)
+                    {
+                        int slot = -1;
+                        for (int r = 0; r < kMaxPendingRelays; r++)
+                        {
+                            if (!s_pendingRelays[r].inUse)
+                            {
+                                slot = r;
+                                break;
+                            }
+                        }
+                        if (slot < 0)
+                            slot = 0; // table full (relaying two things at once is already an edge case) - overwrite the oldest rather than drop this one silently
+                        memcpy(s_pendingRelays[slot].targetMac, s_peers[i].mac, 6);
+                        memcpy(s_pendingRelays[slot].buf, data, len);
+                        s_pendingRelays[slot].len = len;
+                        s_pendingRelays[slot].attemptsRemaining = kRelayResendCount;
+                        s_pendingRelays[slot].nextAttemptMs = millis(); // first attempt fires on the very next rtsnowNodeLoop() call
+                        s_pendingRelays[slot].inUse = true;
+                        break;
+                    }
+                }
+            }
+            return; // not this node's to process, whether relayed or dropped (no known route)
+        }
+
         const uint8_t *payload = data + sizeof(header);
         int payloadLen = len - static_cast<int>(sizeof(header));
+
+        // Peer discovery (see this file's own top-of-section comment) -
+        // purely passive, learned from broadcasts every node already
+        // sends for unrelated reasons. Doesn't return or otherwise change
+        // any of the existing handling below.
+        if ((header.messageType == RTSNOW_ANNOUNCE || header.messageType == RTSNOW_HEARTBEAT) &&
+            payloadLen >= static_cast<int>(sizeof(RTSNOW_DeviceIdentity)))
+        {
+            // Only the leading identity is needed here, not the rest of a
+            // heartbeat - safe to read regardless of whether the sender's
+            // own RTSNOW_Heartbeat is a different (older/newer) size than
+            // this build's, since RTSNOW_DeviceIdentity's own layout never
+            // changes size (see rtsnow_protocol.h).
+            RTSNOW_DeviceIdentity identity;
+            memcpy(&identity, payload, sizeof(identity));
+            notePeer(identity.deviceID, mac);
+        }
 
         if (header.messageType == RTSNOW_REBOOT)
         {
@@ -197,8 +451,24 @@ void rtsnowNodeBegin(const RTSNowNodeConfig &config)
         s_config.heartbeatIntervalMs = 10000;
 
     loadFriendlyName();
+    WiFi.macAddress(s_selfMac);
     esp_now_init(); // WiFi.mode(WIFI_STA) must already have happened by this point
     esp_now_register_recv_cb(onEspNowRecv);
+
+    // Neighbor discovery's RSSI half (see onWifiPromiscuousRx's own
+    // comment for why this needs a separate WiFi promiscuous tap rather
+    // than reading RSSI off the normal ESP-NOW receive callback above).
+    // The driver-level filter does the heavy lifting - only WIFI_PKT_MGMT
+    // frames ever reach the callback at all. Coexists with this node's
+    // own WiFi STA connection to its real AP (unlike gateway-firmware's
+    // node, which stays deliberately unassociated) - promiscuous mode is
+    // a passive additional tap, not exclusive with normal station
+    // operation, a supported combination on this chip.
+    wifi_promiscuous_filter_t promiscuousFilter = {};
+    promiscuousFilter.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT;
+    esp_wifi_set_promiscuous_filter(&promiscuousFilter);
+    esp_wifi_set_promiscuous_rx_cb(onWifiPromiscuousRx);
+    esp_wifi_set_promiscuous(true);
 
     RTSNOW_DeviceIdentity id = makeIdentity();
     sendBroadcast(RTSNOW_ANNOUNCE, &id, sizeof(id));
@@ -222,6 +492,9 @@ void rtsnowNodeLoop()
         RTSNOW_Heartbeat hb{};
         hb.identity = makeIdentity();
         hb.uptimeSeconds = now / 1000;
+        hb.wifiRssi = (WiFi.status() == WL_CONNECTED) ? static_cast<int8_t>(WiFi.RSSI()) : RTSNOW_RSSI_UNKNOWN;
+        strncpy(hb.boardName, s_config.boardName, sizeof(hb.boardName) - 1);
+        hb.neighborCount = buildNeighborList(hb.neighbors, RTSNOW_MAX_NEIGHBORS);
         sendBroadcast(RTSNOW_HEARTBEAT, &hb, sizeof(hb));
 
         // Broadcast alongside the heartbeat (not just in reply to an
@@ -240,6 +513,23 @@ void rtsnowNodeLoop()
         }
 
         s_lastHeartbeatMs = now;
+    }
+
+    // Relay resends (see PendingRelay's own comment) - each due attempt
+    // fires straight from esp_now_send with no delay() here; the
+    // kRelayResendGapMs spacing comes for free from this only being
+    // checked once per rtsnowNodeLoop() pass rather than in a tight loop.
+    for (int i = 0; i < kMaxPendingRelays; i++)
+    {
+        if (!s_pendingRelays[i].inUse || now < s_pendingRelays[i].nextAttemptMs)
+            continue;
+        ensurePeer(s_pendingRelays[i].targetMac);
+        esp_now_send(s_pendingRelays[i].targetMac, s_pendingRelays[i].buf, s_pendingRelays[i].len);
+        s_pendingRelays[i].attemptsRemaining--;
+        if (s_pendingRelays[i].attemptsRemaining == 0)
+            s_pendingRelays[i].inUse = false;
+        else
+            s_pendingRelays[i].nextAttemptMs = now + kRelayResendGapMs;
     }
 
     if (s_pendingSettingAck)

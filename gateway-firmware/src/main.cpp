@@ -20,6 +20,7 @@
 #include <ArduinoJson.h>
 #include <Preferences.h>
 #include <WiFi.h>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <esp_now.h>
@@ -73,6 +74,70 @@ namespace
         uint8_t mac[6];
         uint32_t ipv4Address;
         uint32_t lastSeenMs;
+        // Carried in every RTSNOW_DeviceIdentity announce/heartbeat (see
+        // PROTOCOL.md) but never surfaced to the desktop app until now -
+        // refreshed on every heartbeat below, not just first announce, so
+        // an OTA-updated node's new version shows up without needing to
+        // re-pair.
+        uint8_t firmwareVersionMajor;
+        uint8_t firmwareVersionMinor;
+        uint8_t firmwareVersionPatch;
+        // wifiRssi: this node's own WiFi.RSSI() to its AP, self-reported in
+        // RTSNOW_Heartbeat (see rtsnow_protocol.h's RTSNOW_RSSI_UNKNOWN
+        // comment for why it's a tail-appended field, and why older
+        // firmware's shorter heartbeat just leaves this at the sentinel
+        // instead of being rejected outright). espNowRssi: the RSSI this
+        // gateway itself measured on this device's most recent ESP-NOW
+        // frame - a completely different physical link (node<->gateway,
+        // not node<->router) - see on_wifi_promiscuous_rx() below, the
+        // only writer of this field.
+        int8_t wifiRssi = RTSNOW_RSSI_UNKNOWN;
+        int8_t espNowRssi = RTSNOW_RSSI_UNKNOWN;
+        // Physical hardware variant (e.g. "AtomS3Lite", "M5Tough"), self-
+        // reported in RTSNOW_Heartbeat.boardName - same tail-appended-field
+        // treatment as wifiRssi above. Empty until a heartbeat actually
+        // reports one (older firmware, or a project that hasn't set
+        // RTSNowNodeConfig::boardName).
+        char boardName[16] = "";
+        // This node's own view of which OTHER nodes it can currently hear
+        // over ESP-NOW (see rtsnow_node.cpp's neighbor-discovery section) -
+        // feeds recompute_routing() below. neighborCount 0 covers both
+        // "genuinely has none" and "older firmware that doesn't report
+        // this" identically - same as every other tail-appended heartbeat
+        // field, there's no way (or need) to tell those two apart.
+        uint8_t neighborCount = 0;
+        RTSNOW_NeighborInfo neighbors[RTSNOW_MAX_NEIGHBORS];
+        // 0 = send directly to this device (the default, and the only
+        // option before recompute_routing() ever runs) - otherwise the
+        // deviceID of another known device to relay outbound commands
+        // through instead, because it has a meaningfully better combined
+        // path to this device than the gateway does directly. See
+        // recompute_routing()'s own comment for exactly how "meaningfully
+        // better" is decided, and rtsnow_node.cpp's onEspNowRecv for how
+        // the chosen relay actually forwards the frame on.
+        uint32_t routeViaDeviceId = 0;
+        // True only when THIS device's own most recent heartbeat was
+        // provably long enough on the wire to include the relay-capable
+        // rtsnow_node.cpp's neighbor-discovery/relay-forwarding logic -
+        // see the RTSNOW_HEARTBEAT case in on_espnow_recv, the only
+        // writer of this field, which has the actual received
+        // payloadLen on hand to check this precisely. Deliberately NOT
+        // inferred from neighborCount/wifiRssi/boardName being
+        // zero/empty - those are all "0 might mean legitimately none, or
+        // might mean not reported" by design (see their own comments),
+        // and inferring capability from an ambiguous default very nearly
+        // shipped a real bug here: recompute_routing() picked a relay
+        // candidate that turned out to be running firmware with no
+        // relay-forwarding code at all, since it happened to also read
+        // as "0 neighbors" instead of "capability unknown."
+        // recompute_routing() must never pick a candidate with this
+        // false - an old-firmware "relay" doesn't understand
+        // destinationID at all, so a message unicast to it addressed to
+        // someone else wouldn't get silently dropped, it would get
+        // wrongly processed as if addressed to itself (e.g. a
+        // friendlyName rename meant for the real target applying to the
+        // chosen non-relay-capable "relay" instead).
+        bool supportsRelay = false;
     };
     constexpr int kMaxKnownDevices = 32;
     KnownDevice s_known_devices[kMaxKnownDevices];
@@ -236,7 +301,19 @@ namespace
         esp_now_add_peer(&peer);
     }
 
-    bool send_to(const uint8_t mac[6], RTSNOW_MessageType type, const void *payload, uint16_t payloadLen)
+    // destinationID defaults to broadcast (0xFFFFFFFF) for every existing
+    // call site, which is also what a genuinely direct, non-relayed send
+    // needs: the ESP-NOW hardware itself only ever delivers a unicast
+    // frame to its actual physical destination MAC regardless of what
+    // this logical field says, so an accurate destinationID only starts
+    // to matter for the one new case that actually sets it explicitly -
+    // do_setting_send/do_reboot_send/do_request_registers_send routing a
+    // command through a relay (see recompute_routing()), where `mac`
+    // here is the RELAY's address but destinationID names the real,
+    // final target so that relay's own onEspNowRecv (see
+    // rtsnow_node.cpp) knows who to forward it to.
+    bool send_to(const uint8_t mac[6], RTSNOW_MessageType type, const void *payload, uint16_t payloadLen,
+                 uint32_t destinationID = 0xFFFFFFFF)
     {
         uint8_t buf[250];
         if (sizeof(RTSNOW_Header) + payloadLen > sizeof(buf))
@@ -246,7 +323,7 @@ namespace
         header.version = 1;
         header.messageType = type;
         header.sourceID = local_device_id();
-        header.destinationID = 0xFFFFFFFF; // recipient identity isn't tracked by MAC-only messages
+        header.destinationID = destinationID;
         header.sequence = s_next_sequence++;
         header.payloadLength = payloadLen;
 
@@ -266,7 +343,24 @@ namespace
 
     // ---- Known-device table (RTSNOW_ANNOUNCE / RTSNOW_HEARTBEAT) ----
 
-    void note_known_device(const uint8_t mac[6], const RTSNOW_DeviceIdentity &identity)
+    // Distinct from a real "0 neighbors" (a heartbeat whose sender
+    // genuinely can't currently hear any peer) - see note_known_device's
+    // neighborCount handling, which needs to tell "this caller has no
+    // neighbor data at all" (RTSNOW_ANNOUNCE) apart from "this caller
+    // affirmatively reports zero" (a RTSNOW_HEARTBEAT with an empty
+    // neighbor list).
+    constexpr uint8_t kNeighborCountNotProvided = 0xFF;
+
+    // wifiRssi defaults to RTSNOW_RSSI_UNKNOWN, boardName to "", and
+    // neighborCount to kNeighborCountNotProvided for callers
+    // (RTSNOW_ANNOUNCE) that have none of these - only ever overwrites
+    // the stored value when the caller actually has a fresh one
+    // (RTSNOW_HEARTBEAT), so an announce arriving after a heartbeat
+    // doesn't blank out already-known-good data.
+    void note_known_device(const uint8_t mac[6], const RTSNOW_DeviceIdentity &identity,
+                            int8_t wifiRssi = RTSNOW_RSSI_UNKNOWN, const char *boardName = "",
+                            uint8_t neighborCount = kNeighborCountNotProvided,
+                            const RTSNOW_NeighborInfo *neighbors = nullptr)
     {
         for (int i = 0; i < s_known_device_count; i++)
         {
@@ -278,6 +372,31 @@ namespace
                 memcpy(s_known_devices[i].mac, mac, 6);
                 s_known_devices[i].ipv4Address = identity.ipv4Address;
                 s_known_devices[i].lastSeenMs = millis();
+                s_known_devices[i].firmwareVersionMajor = identity.firmwareVersionMajor;
+                s_known_devices[i].firmwareVersionMinor = identity.firmwareVersionMinor;
+                s_known_devices[i].firmwareVersionPatch = identity.firmwareVersionPatch;
+                if (wifiRssi != RTSNOW_RSSI_UNKNOWN)
+                    s_known_devices[i].wifiRssi = wifiRssi;
+                if (boardName[0] != '\0')
+                {
+                    strncpy(s_known_devices[i].boardName, boardName, sizeof(s_known_devices[i].boardName) - 1);
+                    s_known_devices[i].boardName[sizeof(s_known_devices[i].boardName) - 1] = '\0';
+                }
+                if (neighborCount != kNeighborCountNotProvided)
+                {
+                    uint8_t n = neighborCount < RTSNOW_MAX_NEIGHBORS ? neighborCount : RTSNOW_MAX_NEIGHBORS;
+                    s_known_devices[i].neighborCount = n;
+                    memcpy(s_known_devices[i].neighbors, neighbors, n * sizeof(RTSNOW_NeighborInfo));
+                    // A heartbeat long enough to carry a real
+                    // neighborCount is proof (not inference) that this
+                    // device's firmware includes rtsnow_node.cpp's
+                    // relay-forwarding logic - see supportsRelay's own
+                    // comment. Only ever set true here, never reset to
+                    // false by an announce/old-style-heartbeat call
+                    // (neighborCount == kNeighborCountNotProvided for
+                    // both, so this branch simply doesn't run for them).
+                    s_known_devices[i].supportsRelay = true;
+                }
                 return;
             }
         }
@@ -306,6 +425,24 @@ namespace
         memcpy(s_known_devices[slot].mac, mac, 6);
         s_known_devices[slot].ipv4Address = identity.ipv4Address;
         s_known_devices[slot].lastSeenMs = millis();
+        s_known_devices[slot].firmwareVersionMajor = identity.firmwareVersionMajor;
+        s_known_devices[slot].firmwareVersionMinor = identity.firmwareVersionMinor;
+        s_known_devices[slot].firmwareVersionPatch = identity.firmwareVersionPatch;
+        s_known_devices[slot].wifiRssi = wifiRssi;
+        s_known_devices[slot].espNowRssi = RTSNOW_RSSI_UNKNOWN;
+        strncpy(s_known_devices[slot].boardName, boardName, sizeof(s_known_devices[slot].boardName) - 1);
+        s_known_devices[slot].boardName[sizeof(s_known_devices[slot].boardName) - 1] = '\0';
+        s_known_devices[slot].supportsRelay = (neighborCount != kNeighborCountNotProvided);
+        if (neighborCount != kNeighborCountNotProvided)
+        {
+            uint8_t n = neighborCount < RTSNOW_MAX_NEIGHBORS ? neighborCount : RTSNOW_MAX_NEIGHBORS;
+            s_known_devices[slot].neighborCount = n;
+            memcpy(s_known_devices[slot].neighbors, neighbors, n * sizeof(RTSNOW_NeighborInfo));
+        }
+        else
+        {
+            s_known_devices[slot].neighborCount = 0;
+        }
 
         char logLine[128];
         snprintf(logLine, sizeof(logLine), "New device: id=0x%08X project=\"%s\" type=\"%s\" name=\"%s\"",
@@ -324,6 +461,14 @@ namespace
         dev["mac"] = macStr;
         if (identity.ipv4Address != 0)
             dev["ip"] = IPAddress(identity.ipv4Address).toString();
+        char verStr[16];
+        snprintf(verStr, sizeof(verStr), "%u.%u.%u", identity.firmwareVersionMajor,
+                 identity.firmwareVersionMinor, identity.firmwareVersionPatch);
+        dev["firmwareVersion"] = verStr;
+        if (wifiRssi != RTSNOW_RSSI_UNKNOWN)
+            dev["wifiRssi"] = wifiRssi;
+        if (boardName[0] != '\0')
+            dev["boardName"] = boardName;
         emit_json(doc);
     }
 
@@ -333,6 +478,103 @@ namespace
             if (memcmp(s_known_devices[i].mac, mac, 6) == 0)
                 return i;
         return -1;
+    }
+
+    int find_known_device_by_device_id(uint32_t deviceID)
+    {
+        for (int i = 0; i < s_known_device_count; i++)
+            if (s_known_devices[i].deviceID == deviceID)
+                return i;
+        return -1;
+    }
+
+    // Require a candidate relay path to beat a direct send by a real
+    // margin, not just any positive difference - RSSI naturally jitters
+    // a few dB between readings even with nothing physically changing,
+    // and flipping routing back and forth on that noise would make
+    // behavior harder to reason about for no real benefit. 10dB is a
+    // clearly-audible difference in link quality, not a rounding error.
+    constexpr int8_t kRelayImprovementThresholdDb = 10;
+
+    // Recomputes every known device's routeViaDeviceId (see that field's
+    // own comment) from the same espNowRssi/neighbors data already
+    // collected for the Hardware List table and Mesh page - no new data
+    // collection here, purely a decision made from what's already known.
+    // Deliberately called only from loop() (see its own call site), never
+    // from note_known_device()/on_espnow_recv() directly - this walks
+    // every known device's full neighbor list, which is more work than
+    // belongs inside the ESP-NOW receive callback's own task context
+    // (see "Deferred Serial output" above for why that context stays
+    // cheap on purpose).
+    //
+    // For each target device, considers every OTHER device it reports as
+    // a neighbor as a candidate relay - but only one this gateway also
+    // knows directly (a candidate relay is useless if the gateway itself
+    // can't reach it either). A candidate path's quality is its weakest
+    // single hop (gateway->candidate, candidate->target) - a route is
+    // never better than its worst leg. The best candidate replaces direct
+    // sending only if it beats direct by kRelayImprovementThresholdDb;
+    // ties or small improvements aren't worth the added complexity of a
+    // relay hop (more latency, one more thing that can fail).
+    void recompute_routing()
+    {
+        for (int i = 0; i < s_known_device_count; i++)
+        {
+            KnownDevice &target = s_known_devices[i];
+            int8_t directQuality = target.espNowRssi;
+
+            int8_t bestRelayQuality = RTSNOW_RSSI_UNKNOWN;
+            int bestRelayIdx = -1;
+            for (uint8_t ni = 0; ni < target.neighborCount; ni++)
+            {
+                int candidateIdx = find_known_device_by_device_id(target.neighbors[ni].deviceID);
+                if (candidateIdx < 0 || candidateIdx == i)
+                    continue;
+                if (!s_known_devices[candidateIdx].supportsRelay)
+                    continue; // confirmed relay-capable firmware only - see supportsRelay's own comment for why this check exists at all
+                int8_t gatewayToCandidate = s_known_devices[candidateIdx].espNowRssi;
+                if (gatewayToCandidate == RTSNOW_RSSI_UNKNOWN)
+                    continue; // gateway can't reach this candidate directly either - useless as a relay
+                int8_t candidateToTarget = target.neighbors[ni].rssi;
+                int8_t pathQuality = gatewayToCandidate < candidateToTarget ? gatewayToCandidate : candidateToTarget;
+                if (bestRelayQuality == RTSNOW_RSSI_UNKNOWN || pathQuality > bestRelayQuality)
+                {
+                    bestRelayQuality = pathQuality;
+                    bestRelayIdx = candidateIdx;
+                }
+            }
+
+            bool shouldRelay = bestRelayIdx >= 0 &&
+                                (directQuality == RTSNOW_RSSI_UNKNOWN ||
+                                 bestRelayQuality > directQuality + kRelayImprovementThresholdDb);
+            uint32_t newRouteVia = shouldRelay ? s_known_devices[bestRelayIdx].deviceID : 0;
+
+            if (newRouteVia != target.routeViaDeviceId)
+            {
+                char logLine[160];
+                if (newRouteVia != 0)
+                    snprintf(logLine, sizeof(logLine),
+                             "Routing to \"%s\" via \"%s\" now (direct %d dBm, via %d dBm)", target.friendlyName,
+                             s_known_devices[bestRelayIdx].friendlyName, directQuality, bestRelayQuality);
+                else
+                    snprintf(logLine, sizeof(logLine), "Routing to \"%s\" direct now (was relayed)",
+                             target.friendlyName);
+                queue_output(logLine);
+                target.routeViaDeviceId = newRouteVia;
+            }
+        }
+    }
+
+    uint32_t s_last_routing_recompute_ms = 0;
+    constexpr uint32_t kRoutingRecomputeIntervalMs = 5000; // routing doesn't need to react instantly - a node's default 10s heartbeat interval already bounds how fresh the underlying RSSI data ever is anyway
+
+    void recompute_routing_if_due()
+    {
+        uint32_t now = millis();
+        if (now - s_last_routing_recompute_ms < kRoutingRecomputeIntervalMs)
+            return;
+        s_last_routing_recompute_ms = now;
+        recompute_routing();
     }
 
     // Populates one device's fields onto a JsonObject - shared by the
@@ -350,6 +592,45 @@ namespace
         if (d.ipv4Address != 0)
             dev["ip"] = IPAddress(d.ipv4Address).toString();
         dev["ageMs"] = millis() - d.lastSeenMs;
+        char verStr[16];
+        snprintf(verStr, sizeof(verStr), "%u.%u.%u", d.firmwareVersionMajor, d.firmwareVersionMinor,
+                 d.firmwareVersionPatch);
+        dev["firmwareVersion"] = verStr;
+        // Two distinct physical links, not two views of the same number -
+        // wifiRssi is this node's link to its own Wi-Fi router, espNowRssi
+        // is this node's link to this gateway specifically. Either can be
+        // RTSNOW_RSSI_UNKNOWN (no reading yet) - omitted from the JSON
+        // entirely rather than sent as a misleading number, same
+        // "omit, don't fake" convention as ip above.
+        if (d.wifiRssi != RTSNOW_RSSI_UNKNOWN)
+            dev["wifiRssi"] = d.wifiRssi;
+        if (d.espNowRssi != RTSNOW_RSSI_UNKNOWN)
+            dev["espNowRssi"] = d.espNowRssi;
+        if (d.boardName[0] != '\0')
+            dev["boardName"] = d.boardName;
+        // Diagnostic-only node<->node visibility (see KnownDevice's own
+        // neighborCount comment) - keyed by deviceID since that's what's
+        // on the wire; the desktop app already has deviceID<->MAC for
+        // every device from this same known_devices snapshot, so it can
+        // resolve these itself rather than this also doing MAC lookups
+        // in the hot ESP-NOW callback path.
+        if (d.neighborCount > 0)
+        {
+            JsonArray neighbors = dev["neighbors"].to<JsonArray>();
+            for (uint8_t i = 0; i < d.neighborCount; i++)
+            {
+                JsonObject neighbor = neighbors.add<JsonObject>();
+                neighbor["deviceId"] = d.neighbors[i].deviceID;
+                neighbor["rssi"] = d.neighbors[i].rssi;
+            }
+        }
+        // 0 (the field's own default) means "direct" - omitted here for
+        // the same "omit, don't send a misleading value" reason as every
+        // other optional field above, rather than sending a literal 0
+        // that would need its own special-case meaning on the receiving
+        // end. See recompute_routing() for how this actually gets decided.
+        if (d.routeViaDeviceId != 0)
+            dev["routeViaDeviceId"] = d.routeViaDeviceId;
     }
 
     void send_known_devices_event(const JsonDocument *inDoc)
@@ -669,15 +950,70 @@ namespace
         return nullptr;
     }
 
+    // Sent kRemoteControlResendCount times rather than once, a beat
+    // (kRemoteControlResendGapMs) apart - real-hardware testing found a
+    // meaningfully high single-shot loss rate on this link (a single
+    // reboot, register request, or setting going completely unanswered was
+    // common, not rare), and there's no ack/retry anywhere in this protocol
+    // layer to fall back on. Harmless if the node is duplicate-tolerant,
+    // which is true of all three uses below: RTSNOW_REBOOT is a single
+    // boolean flag, RTSNOW_REQUEST_REGISTERS's each resend just gets its
+    // own independent reply, and RTSNOW_SET_SETTING's onRemoteSetting
+    // handlers (equipmentType/model/spiAddress/spiBaudRate/friendlyName)
+    // are idempotent re-applying the same value. Same "cheap insurance"
+    // tradeoff rtsnow_node.cpp's own initial RTSNOW_ANNOUNCE already makes
+    // (sent twice on boot).
+    constexpr uint8_t kRemoteControlResendCount = 3;
+    constexpr uint32_t kRemoteControlResendGapMs = 40;
+
+    // Resolves the actual physical MAC to unicast to, and the logical
+    // destinationID to put on the frame, for sending a command to known
+    // device `idx` - either directly (routeViaDeviceId == 0, by far the
+    // common case) or through its chosen relay (see recompute_routing()).
+    // Falls back to direct if the chosen relay has since dropped out of
+    // known_devices entirely (a stale decision that recompute_routing_if_due()
+    // will correct on its own within kRoutingRecomputeIntervalMs anyway -
+    // this is just extra safety against ever unicasting to a MAC this
+    // gateway no longer actually has on file).
+    struct SendTarget
+    {
+        const uint8_t *mac;
+        uint32_t destinationID;
+    };
+    SendTarget resolve_send_target(int idx)
+    {
+        const KnownDevice &target = s_known_devices[idx];
+        if (target.routeViaDeviceId != 0)
+        {
+            int relayIdx = find_known_device_by_device_id(target.routeViaDeviceId);
+            if (relayIdx >= 0)
+                return SendTarget{s_known_devices[relayIdx].mac, target.deviceID};
+        }
+        return SendTarget{target.mac, 0xFFFFFFFF};
+    }
+
     // Sends an already-built setting payload (the text and JSON interfaces
-    // each build one their own way - see cmd_setting and handle_setting_command).
+    // each build one their own way - see cmd_setting and
+    // handle_setting_command). Originally sent only once, unlike
+    // do_reboot_send/do_request_registers_send below - found via real
+    // hardware testing to be the odd one out still hitting the same
+    // single-shot loss rate documented above (a renamed node's
+    // friendlyName silently staying unchanged, no RTSNOW_SETTING_ACK ever
+    // arriving) - the desktop app's pending-rename timeout tolerates more
+    // than one ack for the same request fine, it just uses the first one.
     const char *do_setting_send(const uint8_t mac[6], const RTSNOW_SettingPayload &payload)
     {
         int idx = find_known_device_by_mac(mac);
         if (idx < 0)
             return "unknown MAC - it must have announced/heartbeated at least once (see `list`)";
-        ensure_peer(mac);
-        send_to(mac, RTSNOW_SET_SETTING, &payload, sizeof(payload));
+        SendTarget dest = resolve_send_target(idx);
+        ensure_peer(dest.mac);
+        for (uint8_t i = 0; i < kRemoteControlResendCount; i++)
+        {
+            send_to(dest.mac, RTSNOW_SET_SETTING, &payload, sizeof(payload), dest.destinationID);
+            if (i + 1 < kRemoteControlResendCount)
+                delay(kRemoteControlResendGapMs);
+        }
         return nullptr;
     }
 
@@ -687,30 +1023,16 @@ namespace
     // the node received it. See PROTOCOL.md's "Remote control" section for
     // how each side's real confirmation actually arrives (RTSNOW_ANNOUNCE
     // for reboot, RTSNOW_REGISTER_VALUES for a register request).
-    //
-    // Sent kRemoteControlResendCount times rather than once - real-hardware
-    // testing during this feature's development hit a meaningfully high
-    // single-shot loss rate on this link (a single reboot or register
-    // request going completely unanswered was common, not rare), and
-    // there's no ack/retry anywhere in this protocol layer to fall back on.
-    // A few resends a beat apart is the same "cheap insurance" tradeoff
-    // rtsnow_node.cpp's own initial RTSNOW_ANNOUNCE already makes (sent
-    // twice on boot) - harmless if the node is duplicate-tolerant, which
-    // both RTSNOW_REBOOT (a single boolean flag) and
-    // RTSNOW_REQUEST_REGISTERS (each resend just gets its own independent
-    // reply) are.
-    constexpr uint8_t kRemoteControlResendCount = 3;
-    constexpr uint32_t kRemoteControlResendGapMs = 40;
-
     const char *do_reboot_send(const uint8_t mac[6])
     {
         int idx = find_known_device_by_mac(mac);
         if (idx < 0)
             return "unknown MAC - it must have announced/heartbeated at least once (see `list`)";
-        ensure_peer(mac);
+        SendTarget dest = resolve_send_target(idx);
+        ensure_peer(dest.mac);
         for (uint8_t i = 0; i < kRemoteControlResendCount; i++)
         {
-            send_to(mac, RTSNOW_REBOOT, nullptr, 0);
+            send_to(dest.mac, RTSNOW_REBOOT, nullptr, 0, dest.destinationID);
             if (i + 1 < kRemoteControlResendCount)
                 delay(kRemoteControlResendGapMs);
         }
@@ -722,10 +1044,11 @@ namespace
         int idx = find_known_device_by_mac(mac);
         if (idx < 0)
             return "unknown MAC - it must have announced/heartbeated at least once (see `list`)";
-        ensure_peer(mac);
+        SendTarget dest = resolve_send_target(idx);
+        ensure_peer(dest.mac);
         for (uint8_t i = 0; i < kRemoteControlResendCount; i++)
         {
-            send_to(mac, RTSNOW_REQUEST_REGISTERS, nullptr, 0);
+            send_to(dest.mac, RTSNOW_REQUEST_REGISTERS, nullptr, 0, dest.destinationID);
             if (i + 1 < kRemoteControlResendCount)
                 delay(kRemoteControlResendGapMs);
         }
@@ -1253,14 +1576,35 @@ namespace
         }
         case RTSNOW_HEARTBEAT:
         {
-            if (payloadLen < static_cast<int>(sizeof(RTSNOW_Heartbeat)))
+            // Accepts a shorter, pre-wifiRssi/boardName/neighbors
+            // RTSNOW_Heartbeat (identity + uptimeSeconds only) from
+            // firmware that hasn't been rebuilt against the current
+            // rtsnow_protocol.h yet - see wifiRssi's own comment for why
+            // this must stay tolerant rather than rejecting the whole
+            // heartbeat outright. Every trailing field is pre-set to its
+            // "unknown"/empty/not-provided default below, BEFORE the
+            // zero-initialized hb{} gets memcpy'd over - only actually
+            // overwritten if the received payload was long enough to
+            // include real bytes for it. neighborCount specifically must
+            // NOT default to 0 the way hb{} alone would leave it: 0 is
+            // also a real, valid "no neighbors" reading from an up-to-date
+            // sender, so leaving it ambiguous with "field wasn't even
+            // present" would make an older firmware's short heartbeat
+            // wrongly clear out an already-known-good neighbor list (see
+            // kNeighborCountNotProvided).
+            constexpr int kBaseHeartbeatSize = offsetof(RTSNOW_Heartbeat, wifiRssi);
+            if (payloadLen < kBaseHeartbeatSize)
                 return;
-            RTSNOW_Heartbeat hb;
-            memcpy(&hb, payload, sizeof(hb));
+            RTSNOW_Heartbeat hb{};
+            hb.wifiRssi = RTSNOW_RSSI_UNKNOWN;
+            hb.neighborCount = kNeighborCountNotProvided;
+            size_t copyLen = static_cast<size_t>(payloadLen) < sizeof(hb) ? static_cast<size_t>(payloadLen) : sizeof(hb);
+            memcpy(&hb, payload, copyLen);
             hb.identity.projectName[sizeof(hb.identity.projectName) - 1] = '\0';
             hb.identity.deviceTypeName[sizeof(hb.identity.deviceTypeName) - 1] = '\0';
             hb.identity.friendlyName[sizeof(hb.identity.friendlyName) - 1] = '\0';
-            note_known_device(mac, hb.identity);
+            hb.boardName[sizeof(hb.boardName) - 1] = '\0';
+            note_known_device(mac, hb.identity, hb.wifiRssi, hb.boardName, hb.neighborCount, hb.neighbors);
             break;
         }
         case RTSNOW_PROVISION_REQUEST:
@@ -1311,6 +1655,56 @@ namespace
         default:
             break; // not yet handled by this gateway
         }
+    }
+
+    // ---- ESP-NOW RSSI, via WiFi promiscuous sniffing ----
+    //
+    // esp_now_register_recv_cb's own callback (on_espnow_recv above) never
+    // gets an RSSI reading - this SDK's esp_now_recv_cb_t signature is
+    // still the plain (mac, data, len) one with no radio metadata
+    // attached. The radio metadata (wifi_pkt_rx_ctrl_t, which does carry
+    // rssi) is only available by separately registering a WiFi
+    // promiscuous-mode callback, which sees every raw 802.11 frame on the
+    // current channel - filtered here to WIFI_PKT_MGMT only (both by the
+    // driver's own filter, set in setup(), and rechecked here) since
+    // ESP-NOW rides on 802.11 vendor-specific Action frames, a management
+    // subtype - and further filtered to just the ones carrying the
+    // Espressif OUI (18:FE:34) in that Action frame's vendor header, so
+    // this doesn't misattribute an ordinary probe/auth/assoc frame from a
+    // known node's own Wi-Fi STA traffic as if it were an ESP-NOW RSSI
+    // reading.
+    //
+    // Runs in the WiFi driver's own task context, same as
+    // on_espnow_recv - see "Deferred Serial output" above for why nothing
+    // here may block, allocate, or touch Serial: this is only a MAC
+    // comparison against the existing known-device table plus one int8_t
+    // write, deliberately kept that cheap.
+    void on_wifi_promiscuous_rx(void *buf, wifi_promiscuous_pkt_type_t type)
+    {
+        if (type != WIFI_PKT_MGMT)
+            return;
+
+        const wifi_promiscuous_pkt_t *pkt = reinterpret_cast<const wifi_promiscuous_pkt_t *>(buf);
+        const uint8_t *frame = pkt->payload;
+        int frameLen = pkt->rx_ctrl.sig_len;
+
+        // 802.11 MAC header: frame control(2) + duration(2) + addr1(6) +
+        // addr2(6) + addr3(6) + seq control(2) = 24 bytes, then the Action
+        // frame body starts with category(1) + OUI(3).
+        constexpr int kMacHeaderLen = 24;
+        if (frameLen < kMacHeaderLen + 4)
+            return;
+
+        const uint8_t *body = frame + kMacHeaderLen;
+        constexpr uint8_t kVendorSpecificCategory = 0x7F;
+        constexpr uint8_t kEspressifOui[3] = {0x18, 0xFE, 0x34};
+        if (body[0] != kVendorSpecificCategory || memcmp(body + 1, kEspressifOui, 3) != 0)
+            return;
+
+        const uint8_t *sourceMac = frame + 10; // addr2 = transmitter
+        int idx = find_known_device_by_mac(sourceMac);
+        if (idx >= 0)
+            s_known_devices[idx].espNowRssi = pkt->rx_ctrl.rssi;
     }
 
     // ---- LED status ----
@@ -1398,6 +1792,21 @@ void setup()
 
     esp_now_register_recv_cb(on_espnow_recv);
 
+    // ESP-NOW RSSI capture (see on_wifi_promiscuous_rx's own comment for
+    // why this needs a separate WiFi promiscuous callback rather than
+    // just reading it off the normal ESP-NOW receive callback). The
+    // driver-level filter here does the heavy lifting - only
+    // WIFI_PKT_MGMT frames ever reach the callback at all, so ordinary
+    // data traffic on this channel is never even handed to this gateway's
+    // code. Coexists with normal WiFi STA state/ESP-NOW (this gateway
+    // isn't itself joined to an AP - see apply_channel() above), a
+    // well-established pattern for exactly this RSSI-sniffing purpose.
+    wifi_promiscuous_filter_t promiscuousFilter = {};
+    promiscuousFilter.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT;
+    esp_wifi_set_promiscuous_filter(&promiscuousFilter);
+    esp_wifi_set_promiscuous_rx_cb(on_wifi_promiscuous_rx);
+    esp_wifi_set_promiscuous(true);
+
     Serial.println();
     Serial.println("=== RTS ESP-NOW Gateway ===");
     Serial.printf("Local gateway deviceID: 0x%08X\n", local_device_id());
@@ -1414,6 +1823,7 @@ void loop()
     service_serial();
     expire_pending();
     expire_awaiting_confirm();
+    recompute_routing_if_due();
     drain_output_queue();
     update_led();
     delay(20);

@@ -10,7 +10,7 @@ def main():
     app.setApplicationName("RTS ESP-NOW Gateway")
 
     window = MainWindow()
-    window.show()
+    window.showMaximized()
 
     sys.exit(app.exec())
 

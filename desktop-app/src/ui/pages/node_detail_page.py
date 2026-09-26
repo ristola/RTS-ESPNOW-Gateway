@@ -18,25 +18,24 @@ from PySide6.QtWidgets import (
 from src.gateway.models import KnownDevice
 from src.gateway.polymerpak_status import PolymerPakStatusPoller
 
-# Mirrors DeviceSettings.h's kDryerModels/kCrystallizerModels/kEthernetModels
-# and modelTypeCode()'s 0-7 encoding exactly - these are compile-time
+# Mirrors DeviceSettings.h's kDryerModels/kCrystallizerModels and
+# modelTypeCode()'s 0-7 encoding exactly - these are compile-time
 # constants on every SPI-IM/RTSNow node, so there's no need to query a
 # device for them (unlike its *current* equipment/model/address/baud,
 # which do need a live register poll - see show_register_values below).
 #
-# ETHERNET is a model choice, not its own equipment-type button (see
-# DeviceSettings.h's kEthernetModels comment) - only Dryer/
-# Crystallizer appear in EQUIPMENT_TYPES; ETHERNET_MODEL is instead always
-# appended to whichever equipment's model list is showing, in
-# _rebuild_model_buttons, and reachable regardless of which equipment
-# button is currently active (the node's own onRemoteSetting() accepts it
-# unconditionally too - see main_atom_node.cpp/main.cpp).
+# An "ETHERNET" model button used to always be appended here too,
+# regardless of equipment - the one real consumer, RTSNow-SPI-CCP's
+# env:node_atoms3_poe (AtomS3 + PoE/W5500 base instead of an RS-485
+# tail), is retired/no longer in use as of 2026-09-20 (confirmed by the
+# user, not assumed) - see _rebuild_model_buttons for where it was
+# removed. MODEL_TYPE_CODES below still has its old code-7 slot, kept
+# for decoding compatibility (see that constant's own comment).
 EQUIPMENT_TYPES = ["Dryer", "Crystallizer"]
 MODELS_BY_EQUIPMENT = {
     "Dryer": ["FC", "FD", "FN", "ADV", "CD"],
     "Crystallizer": ["FC-XTLR", "FN-XTLR"],
 }
-ETHERNET_MODEL = "ETHERNET"
 BAUD_RATES = [1200, 2400, 4800, 9600, 19200]
 
 # PolymerPak's solar-tracker settings (see that project's
@@ -339,11 +338,22 @@ class NodeDetailPage(QWidget):
 
     def _rebuild_model_buttons(self, equipment: str, active_model: str | None = None):
         """Swaps the Model row's buttons to match `equipment`'s valid model
-        list (see MODELS_BY_EQUIPMENT), always with ETHERNET appended as an
-        extra choice regardless of equipment (see the module comment) -
-        called whenever the Equipment selection changes, or fresh register
-        values report a different equipment/model than what was previously
-        shown."""
+        list (see MODELS_BY_EQUIPMENT) - called whenever the Equipment
+        selection changes, or fresh register values report a different
+        equipment/model than what was previously shown.
+
+        ETHERNET used to always be appended here as an extra choice
+        regardless of equipment (see the module comment) - the
+        one real consumer, RTSNow-SPI-CCP's env:node_atoms3_poe (AtomS3 +
+        PoE/W5500 base instead of an RS-485 tail), is retired/no longer
+        in use as of 2026-09-20, confirmed directly by the user rather
+        than assumed - so the button is removed here. MODEL_TYPE_CODES
+        is left untouched (still has the correct 0-7 positional mapping
+        DeviceSettings.cpp's modelTypeCode() defines) since editing it
+        would risk breaking decoding for the other, still-real codes;
+        if a device ever reports code 7 now, _update_rtsnow_config_from_
+        registers still decodes it without erroring, it just won't find
+        a matching button to highlight."""
         for btn in list(self._model_buttons.values()):
             self.model_group.removeButton(btn)
             self.model_row.removeWidget(btn)
@@ -352,7 +362,7 @@ class NodeDetailPage(QWidget):
 
         # Insert before the trailing stretch (always the last item in the row).
         insert_at = self.model_row.count() - 1
-        for name in MODELS_BY_EQUIPMENT.get(equipment, []) + [ETHERNET_MODEL]:
+        for name in MODELS_BY_EQUIPMENT.get(equipment, []):
             btn = QPushButton(name)
             btn.setCheckable(True)
             btn.setChecked(name == active_model)

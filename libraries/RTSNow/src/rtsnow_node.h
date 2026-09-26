@@ -37,6 +37,11 @@ struct RTSNowNodeConfig
     const char *projectName = "";         // truncated to 15 chars (RTSNOW_DeviceIdentity.projectName)
     const char *deviceTypeName = "";      // truncated to 15 chars
     const char *defaultFriendlyName = ""; // used only until a rename is saved; truncated to 23 chars
+    // Optional: physical hardware variant (e.g. "AtomS3Lite", "M5Tough" -
+    // see RTSNow-SPI-CCP's BOARD_NAME build flag), sent in every heartbeat
+    // (RTSNOW_Heartbeat.boardName) - truncated to 15 chars. Left "" (the
+    // default) reports nothing, same as any project that hasn't opted in.
+    const char *boardName = "";
     uint8_t firmwareVersionMajor = 0;
     uint8_t firmwareVersionMinor = 0;
     uint8_t firmwareVersionPatch = 0;

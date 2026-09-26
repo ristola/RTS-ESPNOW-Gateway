@@ -30,12 +30,23 @@ from src.gateway.serial_client import GatewayClient
 from src.ui.pages.dashboard_page import DashboardPage
 from src.ui.pages.dryer_detail_page import DryerDetailPage
 from src.ui.pages.flash_node_page import FlashNodePage
+from src.ui.pages.mesh_page import MeshPage
 from src.ui.pages.node_detail_page import NodeDetailPage
 from src.ui.pages.rtsnow_page import RtsNowPage
 
 POLL_INTERVAL_MS = 2000
 VERIFY_TIMEOUT_MS = 3000
-RENAME_CONFIRM_TIMEOUT_MS = 5000
+# The gateway's own do_setting_send already resends 3x, but all 3 land
+# within ~80ms of each other (see gateway-firmware/src/main.cpp's
+# kRemoteControlResendGapMs) - fine for a strong link, not enough time-
+# diversity to survive a longer fade on a weaker one. Confirmed on real
+# hardware: a node with a noticeably weaker ESP-NOW link than its sibling
+# dropped roughly 2 of 5 single-burst rename attempts outright. Resending
+# the whole command again here, spaced RENAME_RETRY_INTERVAL_MS apart,
+# gives each attempt its own independent burst at a different moment -
+# much likelier to land on at least one of RENAME_MAX_ATTEMPTS tries.
+RENAME_RETRY_INTERVAL_MS = 1500
+RENAME_MAX_ATTEMPTS = 4
 RTSNOW_CHANNEL_MIN = 1
 RTSNOW_CHANNEL_MAX = 11
 
@@ -57,12 +68,13 @@ class MainWindow(QMainWindow):
         self.known_devices: dict[str, KnownDevice] = {}
         self._pending_acks: dict[int, str] = {}
         self._ota_client: OtaPushClient | None = None
+        self._ota_target_page = None  # whichever page's ota_requested started the in-flight push
         self._verified = False  # confirmed the connected port is actually an RTS ESP-NOW Gateway
         self._node_flasher: NodeFlasherClient | None = None
         self._mac_readers: list[ChipMacReader] = []
         self._scan_results: list[dict] = []
         self._scan_pending_ports: list[tuple[str, str]] = []  # (port, description) still to read
-        self._pending_renames: dict[str, QTimer] = {}  # mac -> confirmation timeout timer
+        self._pending_renames: dict[str, dict] = {}  # mac -> {"timer": retry QTimer, "attempts": int}
 
         # equipmentType/model for RTSNow-project devices, fetched once per
         # mac from the node's own /api/data (see DeviceInfoFetcher) -
@@ -190,8 +202,23 @@ class MainWindow(QMainWindow):
         layout.addWidget(branding)
 
         sidebar = QListWidget()
-        self._add_nav_item(sidebar, "Dashboard", ("dashboard", None))
+        # Qt's default palette renders a selected-but-unfocused row in a
+        # dimmer gray (the "inactive" selection color) vs. the brighter
+        # blue "active" one - noticeable specifically because
+        # _select_sidebar_device_row() selects a row programmatically
+        # without also moving keyboard focus into the sidebar, so a
+        # device reached via the RTSNow page/Dashboard table showed gray
+        # instead of the blue a direct sidebar click gets. Forcing
+        # :selected to the same blue regardless of the (separate,
+        # unrelated to "what page is this") focus state keeps the
+        # highlight consistent no matter how a page was reached.
+        sidebar.setStyleSheet(
+            "QListWidget::item:selected { background: #2f6fed; color: white; }"
+            "QListWidget::item:selected:!active { background: #2f6fed; color: white; }"
+        )
+        self._add_nav_item(sidebar, "Hardware List", ("dashboard", None))
         self._add_nav_item(sidebar, self._RTSNOW_CHILD_INDENT + "Flash Node", ("flash_node", None))
+        self._add_nav_item(sidebar, self._RTSNOW_CHILD_INDENT + "Mesh", ("mesh", None))
         separator = self._add_nav_item(sidebar, "", ("separator", None))
         separator.setFlags(Qt.ItemFlag.NoItemFlags)  # blank spacer row - not selectable/clickable
         self._add_nav_item(sidebar, "RTSNow", ("rtsnow", None))
@@ -320,19 +347,38 @@ class MainWindow(QMainWindow):
 
         self.node_detail_page = NodeDetailPage()
         self.node_detail_page.rename_requested.connect(self._on_rename_requested)
-        self.node_detail_page.ota_requested.connect(self._on_ota_requested)
+        self.node_detail_page.ota_requested.connect(
+            lambda ip, file_path: self._start_ota(ip, file_path, self.node_detail_page)
+        )
         self.node_detail_page.reboot_requested.connect(self._on_reboot_requested)
         self.node_detail_page.poll_registers_requested.connect(self._on_poll_registers_requested)
         self.node_detail_page.config_setting_requested.connect(self._on_config_setting_requested)
         self.pages.addWidget(self.node_detail_page)
 
         self.dryer_detail_page = DryerDetailPage()
+        # Reuses the exact same handlers NodeDetailPage's own Reboot/OTA
+        # controls already wire up - neither cares which page asked, just
+        # who to report progress/results back to (see _start_ota/
+        # _on_ota_finished's _ota_target_page tracking). DryerDetailPage
+        # no longer has a plain "navigate to NodeDetailPage" menu_
+        # requested signal at all - Configuration, Remote Control
+        # (reboot+OTA), and Registers all got their own popups directly
+        # on that page, so there's nothing left NodeDetailPage offers for
+        # a confirmed Dryer that isn't already duplicated there.
+        self.dryer_detail_page.reboot_requested.connect(self._on_reboot_requested)
+        self.dryer_detail_page.ota_requested.connect(
+            lambda ip, file_path: self._start_ota(ip, file_path, self.dryer_detail_page)
+        )
+        self.dryer_detail_page.rename_requested.connect(self._on_rename_requested)
         self.pages.addWidget(self.dryer_detail_page)
 
         self.flash_node_page = FlashNodePage()
         self.flash_node_page.scan_requested.connect(self._on_scan_nodes_requested)
         self.flash_node_page.flash_requested.connect(self._on_flash_node_requested)
         self.pages.addWidget(self.flash_node_page)
+
+        self.mesh_page = MeshPage()
+        self.pages.addWidget(self.mesh_page)
 
         return self.pages
 
@@ -360,6 +406,8 @@ class MainWindow(QMainWindow):
             self.pages.setCurrentWidget(self.rtsnow_page)
         elif role == "flash_node":
             self.pages.setCurrentWidget(self.flash_node_page)
+        elif role == "mesh":
+            self.pages.setCurrentWidget(self.mesh_page)
         elif role == "device":
             dev = self.known_devices.get(payload)
             if dev is not None:
@@ -369,16 +417,34 @@ class MainWindow(QMainWindow):
         dev = self.known_devices.get(mac)
         if dev is None:
             return
-        # Node Detail/Dryer Detail have no sidebar item of their own -
-        # reached only by clicking a device, here (the Dashboard's
-        # known-devices table, any project), one of RTSNow's per-device
-        # sidebar children, or an RTSNow page icon tile. Just swap the
-        # page directly; the sidebar's own highlighted item (wherever the
-        # click came from) is left as-is rather than forced to match.
+        # Node Detail/Dryer Detail have no sidebar item of their own - this
+        # is reached from the Dashboard's known-devices table or an
+        # RTSNow page icon tile, neither of which is itself a sidebar row,
+        # so the sidebar's own highlight would otherwise be left wherever
+        # it last was (or nothing at all) instead of matching what's
+        # actually on screen. _select_sidebar_device_row jumps the
+        # highlight to that device's own child row, same one clicking it
+        # directly in the sidebar would select.
+        self._select_sidebar_device_row(mac)
         self._show_device_page(dev)
 
     def _on_rtsnow_device_selected(self, mac: str):
         self._on_node_selected(mac)
+
+    def _select_sidebar_device_row(self, mac: str):
+        """Highlights `mac`'s per-device sidebar child (under RTSNow or
+        PolymerPak - see _rebuild_children_for_project), if it currently
+        has one - a device hidden by "Show Online Only" won't. Signals are
+        blocked around the actual selection change so this can't loop
+        back into _on_sidebar_item_changed and re-run _show_device_page a
+        second time for the same click."""
+        for row in range(self.sidebar.count()):
+            role, payload = self.sidebar.item(row).data(Qt.ItemDataRole.UserRole)
+            if role == "device" and payload == mac:
+                self.sidebar.blockSignals(True)
+                self.sidebar.setCurrentRow(row)
+                self.sidebar.blockSignals(False)
+                return
 
     def _show_device_page(self, dev: KnownDevice):
         """Routes to the per-equipment-type detail page for `dev` - only
@@ -414,13 +480,15 @@ class MainWindow(QMainWindow):
         if not connected:
             self.dashboard_page.reset()
             # Not clearing _info_fetchers here - any still in flight are
-            # one-shot, self-terminating within DeviceInfoFetcher._TIMEOUT_S,
-            # and remove themselves from that dict via their own
-            # info_received/info_error signal once done (see
-            # _on_device_info_received/_error). Dropping this dict's
-            # references before that fires would risk destroying a QThread
-            # object whose underlying OS thread is still running -
-            # undefined behavior in Qt (same hazard DryerStatusPoller's
+            # one-shot and remove themselves from that dict via their own
+            # finished signal once the thread has actually stopped (see
+            # _ensure_device_info's comment - deliberately NOT tied to
+            # info_received/info_error, which fire from inside run()
+            # itself, before the OS thread has finished unwinding).
+            # Dropping this dict's references before finished fires would
+            # risk destroying a QThread object while it's still running -
+            # undefined behavior in Qt (confirmed via a real crash report,
+            # not just theoretical - same hazard DryerStatusPoller's
             # STOP_WAIT_MS comment is about), not just a leak.
             self._device_info = {}
             self.rtsnow_page.update_devices([], {})
@@ -536,26 +604,42 @@ class MainWindow(QMainWindow):
         # gone silent still got an `ok:true` ack back, since the gateway
         # doesn't wait for the node's actual RTSNOW_SETTING_ACK before
         # answering the JSON command). The real confirmation is the
-        # separate, unsolicited `setting_ack` event below - track it with
-        # a timeout so the UI doesn't just trust the immediate ack.
-        self._send(
-            {"cmd": "setting", "mac": mac, "key": "friendlyName", "valueType": "string", "value": new_name},
-            f"rename {mac} to \"{new_name}\"",
-        )
-        old_timer = self._pending_renames.pop(mac, None)
-        if old_timer is not None:
-            old_timer.stop()
-        timer = QTimer(self)
-        timer.setSingleShot(True)
-        timer.timeout.connect(lambda: self._on_rename_confirm_timeout(mac))
-        self._pending_renames[mac] = timer
-        timer.start(RENAME_CONFIRM_TIMEOUT_MS)
+        # separate, unsolicited `setting_ack` event handled below.
+        #
+        # Resends the whole command up to RENAME_MAX_ATTEMPTS times,
+        # RENAME_RETRY_INTERVAL_MS apart, rather than sending once and just
+        # waiting - see that constant's comment for why a single attempt
+        # (even with the gateway's own internal 3x resend) wasn't reliable
+        # enough on a weaker link.
+        old = self._pending_renames.pop(mac, None)
+        if old is not None:
+            old["timer"].stop()
+
+        state = {"attempts": 0, "timer": QTimer(self)}
+
+        def send_attempt():
+            state["attempts"] += 1
+            self._send(
+                {"cmd": "setting", "mac": mac, "key": "friendlyName", "valueType": "string", "value": new_name},
+                f"rename {mac} to \"{new_name}\" (attempt {state['attempts']}/{RENAME_MAX_ATTEMPTS})",
+            )
+            if state["attempts"] >= RENAME_MAX_ATTEMPTS:
+                state["timer"].stop()
+                self._on_rename_confirm_timeout(mac)
+
+        state["timer"].timeout.connect(send_attempt)
+        self._pending_renames[mac] = state
+        send_attempt()
+        state["timer"].start(RENAME_RETRY_INTERVAL_MS)
 
     def _on_rename_confirm_timeout(self, mac: str):
         self._pending_renames.pop(mac, None)
         self._log(f"No confirmation from {mac} for the rename - it may be offline.")
+        status = "No confirmation received - node may be offline."
         if self.node_detail_page.current_mac() == mac:
-            self.node_detail_page.set_rename_status("No confirmation received - node may be offline.")
+            self.node_detail_page.set_rename_status(status)
+        if self.dryer_detail_page.current_mac() == mac:
+            self.dryer_detail_page.set_rename_status(status)
 
     def _on_reboot_requested(self, mac: str):
         # Same caveat as rename above: this `ack` only confirms the gateway
@@ -591,20 +675,25 @@ class MainWindow(QMainWindow):
             f"setting {mac} {key}={value}",
         )
 
-    def _on_ota_requested(self, ip: str, file_path: str):
+    def _start_ota(self, ip: str, file_path: str, target_page):
+        # target_page just needs set_ota_progress(int)/set_ota_result(bool,
+        # str) - both NodeDetailPage and DryerDetailPage implement them
+        # the same way, so this doesn't care which one's asking.
         if self._ota_client is not None:
             QMessageBox.warning(self, "OTA in progress", "Wait for the current OTA update to finish first.")
             return
         self._log(f"-> OTA push to {ip}: {file_path}")
+        self._ota_target_page = target_page
         self._ota_client = OtaPushClient(ip, file_path)
-        self._ota_client.progress.connect(self.node_detail_page.set_ota_progress)
+        self._ota_client.progress.connect(target_page.set_ota_progress)
         self._ota_client.finished.connect(self._on_ota_finished)
         self._ota_client.start()
 
     def _on_ota_finished(self, success: bool, message: str):
-        self.node_detail_page.set_ota_result(success, message)
+        self._ota_target_page.set_ota_result(success, message)
         self._log(("OTA succeeded: " if success else "OTA FAILED: ") + message)
         self._ota_client = None
+        self._ota_target_page = None
 
     # ---- Node onboarding (Flash Node page) ----
 
@@ -714,11 +803,12 @@ class MainWindow(QMainWindow):
             status = "accepted" if accepted else "rejected"
             self._log(f"Setting \"{key}\" {status} by {mac}.")
             if key == "friendlyName" and mac in self._pending_renames:
-                self._pending_renames.pop(mac).stop()
+                self._pending_renames.pop(mac)["timer"].stop()
+                rename_status = "Confirmed by node." if accepted else "Node rejected the rename."
                 if self.node_detail_page.current_mac() == mac:
-                    self.node_detail_page.set_rename_status(
-                        "Confirmed by node." if accepted else "Node rejected the rename."
-                    )
+                    self.node_detail_page.set_rename_status(rename_status)
+                if self.dryer_detail_page.current_mac() == mac:
+                    self.dryer_detail_page.set_rename_status(rename_status)
             elif key in (
                 "equipmentType", "model", "spiAddress", "spiBaudRate",
                 "siteLatitude", "siteLongitude", "sunElevationDeg", "trackerStepDeg",
@@ -753,6 +843,7 @@ class MainWindow(QMainWindow):
     def _update_known_devices(self, devices_json: list[dict]):
         self.known_devices = {d["mac"]: KnownDevice.from_json(d) for d in devices_json}
         self.node_network_page.update_devices(devices_json)
+        self.mesh_page.update_devices(list(self.known_devices.values()))
         self._rebuild_all_project_children()
 
         rtsnow_devices = [dev for dev in self.known_devices.values() if dev.project_name == "RTSNow"]
@@ -781,22 +872,36 @@ class MainWindow(QMainWindow):
         fetcher = DeviceInfoFetcher(dev.mac, dev.ip)
         fetcher.info_received.connect(self._on_device_info_received)
         fetcher.info_error.connect(self._on_device_info_error)
+        # Cleanup (dropping _info_fetchers' reference, the only thing
+        # keeping this QThread alive) deliberately happens on QThread's
+        # own finished signal, not from info_received/info_error - those
+        # fire from inside run() itself, before the OS thread has
+        # actually finished unwinding, so popping the dict there raced
+        # with the thread still being marked "running" and crashed
+        # (confirmed via an actual macOS crash report: run() -> Python
+        # deallocates this object -> ~QThread() fires while isRunning()
+        # is still true -> Qt's qFatal() -> SIGABRT). finished only ever
+        # fires after the thread has truly stopped, so this can't race.
+        fetcher.finished.connect(lambda mac=dev.mac: self._info_fetchers.pop(mac, None))
         self._info_fetchers[dev.mac] = fetcher
         fetcher.start()
 
     def _on_device_info_received(self, mac: str, data: dict):
-        self._info_fetchers.pop(mac, None)
+        # _info_fetchers' own cleanup happens on the fetcher's finished
+        # signal, not here - see _ensure_device_info's comment.
         self._device_info[mac] = data
         rtsnow_devices = [dev for dev in self.known_devices.values() if dev.project_name == "RTSNow"]
         self.rtsnow_page.update_devices(rtsnow_devices, self._device_info)
 
     def _on_device_info_error(self, mac: str, _message: str):
-        self._info_fetchers.pop(mac, None)
         # Deliberately doesn't cache a failure into _device_info - leaves
         # this mac eligible for _ensure_device_info() to retry on the next
         # known_devices snapshot instead of getting stuck on the default
         # icon/routing forever after one bad request (e.g. the node was
-        # mid-reboot when this fired).
+        # mid-reboot when this fired). _info_fetchers' own cleanup
+        # happens on the fetcher's finished signal, not here - see
+        # _ensure_device_info's comment.
+        pass
 
     def _on_raw_line(self, line: str):
         self.raw_log.appendPlainText(line)
