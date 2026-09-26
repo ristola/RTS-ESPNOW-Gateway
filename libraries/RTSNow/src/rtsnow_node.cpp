@@ -696,6 +696,8 @@ void rtsnowNodeLoop()
             s_otaActive = true;
             s_otaTotalChunks = s_pendingOtaStart.totalChunks;
             s_otaNextExpectedIndex = 0;
+            if (s_config.onOtaActiveChanged != nullptr)
+                s_config.onOtaActiveChanged(true);
         }
         RTSNOW_OtaAck ack{};
         ack.ok = began ? 1 : 0;
@@ -761,6 +763,8 @@ void rtsnowNodeLoop()
             Serial.printf("RTS-NOW: OTA-over-ESP-NOW failed: %s\n", ack.message);
             Update.abort();
             s_otaActive = false;
+            if (s_config.onOtaActiveChanged != nullptr)
+                s_config.onOtaActiveChanged(false);
         }
     }
 
@@ -772,6 +776,8 @@ void rtsnowNodeLoop()
             Update.abort();
             s_otaActive = false;
             Serial.println("RTS-NOW: OTA-over-ESP-NOW aborted");
+            if (s_config.onOtaActiveChanged != nullptr)
+                s_config.onOtaActiveChanged(false);
         }
     }
 

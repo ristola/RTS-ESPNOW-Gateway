@@ -98,6 +98,20 @@ struct RTSNowNodeConfig
     // behavior before this hook existed.
     using GenericSettingHandler = bool (*)(const RTSNOW_SettingPayload &setting);
     GenericSettingHandler onGenericSetting = nullptr;
+
+    // Optional: called from rtsnowNodeLoop() whenever this node's ESP-NOW
+    // OTA transfer becomes active or inactive - true once an OTA_START is
+    // accepted, false once OTA_END or OTA_ABORT resolves it (success or
+    // failure either way). Lets a host project drive the same "update in
+    // progress" visual signal its WiFi OTA already shows via ArduinoOTA's
+    // own onStart/onError (e.g. blinking an LED), without this library
+    // needing to know anything about LEDs/displays itself - mirrors
+    // onBeforeReboot's role for reboots. Only ever called on an actual
+    // true/false transition, never redundantly every loop() tick. Left null
+    // (the default) - no signal, same as every project before this hook
+    // existed.
+    using OtaActiveHook = void (*)(bool active);
+    OtaActiveHook onOtaActiveChanged = nullptr;
 };
 
 void rtsnowNodeBegin(const RTSNowNodeConfig &config);
