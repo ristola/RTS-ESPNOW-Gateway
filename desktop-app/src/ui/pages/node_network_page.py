@@ -1,7 +1,7 @@
 from typing import Optional
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QFontDatabase
 from PySide6.QtWidgets import (
     QCheckBox,
     QGroupBox,
@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src.gateway.models import KnownDevice
+from src.gateway.models import KnownDevice, device_type_label
 
 DEVICE_COLUMNS = ["Project", "Type", "Firmware Version", "Name", "MAC", "IP", "WiFi", "MESH", "Last Seen"]
 
@@ -65,6 +65,7 @@ class NodeNetworkPage(QWidget):
     node_selected = Signal(str)  # mac - user wants to see this device's detail page
     online_only_toggled = Signal(bool)  # lets main_window also filter the RTSNow sidebar children
     forget_requested = Signal(str)  # mac - user confirmed "Forget Node" from the context menu
+    set_default_gateway_requested = Signal(str)  # ip - "Set As Default Gateway" from the context menu
 
     def __init__(self):
         super().__init__()
@@ -86,6 +87,11 @@ class NodeNetworkPage(QWidget):
         header = self.devices_table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(DEVICE_COLUMNS.index("Name"), QHeaderView.ResizeMode.Stretch)
+        # Cramped by default (Qt's stock cell padding is nearly zero) -
+        # matches the breathing room the gateway's own HTML status page
+        # gives its tables (see gateway-firmware's write_http_style).
+        self.devices_table.setStyleSheet("QTableWidget::item { padding: 4px 10px; }")
+        self.devices_table.verticalHeader().setDefaultSectionSize(28)
         self.devices_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.devices_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.devices_table.itemDoubleClicked.connect(self._on_device_double_clicked)
@@ -130,11 +136,18 @@ class NodeNetworkPage(QWidget):
             dev for dev in self.known_devices.values()
             if not show_online_only or dev.age_ms < ONLINE_THRESHOLD_MS
         ]
+        # The ▂▄▆█▁ bar glyphs format_rssi() builds only line up cleanly at
+        # a fixed advance width - the same reason the gateway's own HTML
+        # status page needs font-family:monospace on that cell (see
+        # gateway-firmware's td.rssi rule); the platform's UI font left
+        # them rendering at inconsistent widths, looking garbled/overlapping.
+        rssi_font = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
+        rssi_columns = {DEVICE_COLUMNS.index("WiFi"), DEVICE_COLUMNS.index("MESH")}
         self.devices_table.setRowCount(len(rows))
         for row, dev in enumerate(rows):
             values = [
                 dev.project_name,
-                dev.device_type_name,
+                device_type_label(dev.device_type_name),
                 dev.firmware_version,
                 dev.friendly_name,
                 dev.mac,
@@ -144,7 +157,10 @@ class NodeNetworkPage(QWidget):
                 f"{dev.age_ms // 1000}s ago",
             ]
             for col, value in enumerate(values):
-                self.devices_table.setItem(row, col, QTableWidgetItem(value))
+                item = QTableWidgetItem(value)
+                if col in rssi_columns:
+                    item.setFont(rssi_font)
+                self.devices_table.setItem(row, col, item)
 
     def _on_online_only_toggled(self, checked: bool):
         self._render_devices_table()
@@ -163,10 +179,18 @@ class NodeNetworkPage(QWidget):
         self.devices_table.selectRow(row)
         mac = self.devices_table.item(row, DEVICE_COLUMNS.index("MAC")).text()
         name = self.devices_table.item(row, DEVICE_COLUMNS.index("Name")).text()
+        ip = self.devices_table.item(row, DEVICE_COLUMNS.index("IP")).text()
         menu = QMenu(self)
         forget_action = QAction("Forget Node", self)
         forget_action.triggered.connect(lambda: self._on_forget_node(mac, name))
         menu.addAction(forget_action)
+        # Only offered for a device with a real IP - a mesh-only node (IP
+        # column showing "-") has no address MainWindow could ever dial
+        # into on startup anyway.
+        if ip and ip != "-":
+            set_gateway_action = QAction("Set As Default Gateway", self)
+            set_gateway_action.triggered.connect(lambda: self._on_set_default_gateway(ip, name))
+            menu.addAction(set_gateway_action)
         menu.exec(self.devices_table.viewport().mapToGlobal(pos))
 
     def _on_forget_node(self, mac: str, name: str):
@@ -177,3 +201,12 @@ class NodeNetworkPage(QWidget):
         ) != QMessageBox.StandardButton.Yes:
             return
         self.forget_requested.emit(mac)
+
+    def _on_set_default_gateway(self, ip: str, name: str):
+        if QMessageBox.question(
+            self, "Set as default gateway",
+            f"Try connecting to {name} ({ip}) automatically every time the app starts, "
+            "before falling back to a manual USB port selection?"
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        self.set_default_gateway_requested.emit(ip)

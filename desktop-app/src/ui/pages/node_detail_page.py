@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src.gateway.models import KnownDevice
+from src.gateway.models import GATEWAY_DEVICE_TYPES, KnownDevice, device_type_label
 from src.gateway.polymerpak_status import PolymerPakStatusPoller
 
 # Mirrors DeviceSettings.h's kDryerModels/kCrystallizerModels and
@@ -461,12 +461,15 @@ class NodeDetailPage(QWidget):
         # attached - a different project reached via the Dashboard's
         # device table (e.g. PolymerPak's solar tracker, see
         # POLYMERPAK_FIELDS) gets its own Configuration box instead, and
-        # the RTS-NOW mesh gateway itself (EthernetGateway - see
-        # main_atom_node.cpp's own comment: no RS-485 transceiver wired to
-        # anything on that board at all) has no equipment configuration of
-        # its own to show either. Anything unrecognized shows neither,
-        # rather than guessing.
-        self.config_box.setVisible(dev.project_name == "RTSNow" and dev.device_type_name != "EthernetGateway")
+        # neither RTS-NOW gateway (USB dongle or PoE/Ethernet - see
+        # GATEWAY_DEVICE_TYPES) has any RS-485 transceiver wired to
+        # anything at all, so neither has equipment configuration to show
+        # either. Anything unrecognized shows neither, rather than
+        # guessing. (Bug fixed 2026-09-26: this used to only exclude
+        # "EthernetGateway" by name, so the dongle's own then-newly-
+        # renamed "UsbGateway" type slipped through and showed a bogus
+        # Dryer/Crystallizer config box for it.)
+        self.config_box.setVisible(dev.project_name == "RTSNow" and dev.device_type_name not in GATEWAY_DEVICE_TYPES)
         self.polymerpak_config_box.setVisible(dev.project_name == "PolymerPak")
         self.remote_box.setVisible(True)
         self.ota_box.setVisible(True)
@@ -482,7 +485,7 @@ class NodeDetailPage(QWidget):
 
         self.device_id_label.setText(f"0x{dev.device_id:08X}")
         self.project_label.setText(dev.project_name)
-        self.type_label.setText(dev.device_type_name)
+        self.type_label.setText(device_type_label(dev.device_type_name))
         if not self.name_edit.hasFocus():
             # Don't clobber an in-progress edit if a periodic known_devices
             # refresh happens to land while the user is mid-typing.

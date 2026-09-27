@@ -24,10 +24,12 @@ from PySide6.QtWidgets import (
 from src.gateway.device_info_client import DeviceInfoFetcher
 from src.gateway.espnow_ota_transfer import EspNowOtaTransfer
 from src.gateway.models import KnownDevice
+from src.gateway.network_client import NetworkGatewayClient
 from src.gateway.node_flasher import ChipMacReader, NodeFlasherClient, PioBuildClient
 from src.gateway.ota_client import OtaPushClient
 from src.gateway.ports import list_serial_ports
 from src.gateway.serial_client import GatewayClient
+from src.gateway.settings import get_default_gateway_ip, set_default_gateway_ip
 from src.ui.pages.dashboard_page import DashboardPage
 from src.ui.pages.dryer_detail_page import DryerDetailPage
 from src.ui.pages.espnow_flash_page import EspNowFlashPage
@@ -65,8 +67,14 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("RTS ESP-NOW Gateway")
         self.resize(1200, 750)
 
-        self.client: GatewayClient | None = None
+        self.client: GatewayClient | NetworkGatewayClient | None = None
         self._connected_port: str | None = None
+        # Set while an automatic startup attempt at the remembered default
+        # gateway IP is in flight (see _try_default_gateway_on_startup) -
+        # distinguishes "no gateway there yet, quietly fall back to manual
+        # USB" from a real error worth a dialog, which every other
+        # verify-timeout/error path below still wants.
+        self._connecting_via_network = False
         self.known_devices: dict[str, KnownDevice] = {}
         self._pending_acks: dict[int, str] = {}
         self._ota_client: OtaPushClient | None = None
@@ -99,6 +107,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._refresh_ports()
         self._set_connected_ui(False)
+        self._try_default_gateway_on_startup()
 
     # ---- UI construction ----
 
@@ -350,6 +359,7 @@ class MainWindow(QMainWindow):
         self.node_network_page.node_selected.connect(self._on_node_selected)
         self.node_network_page.online_only_toggled.connect(lambda _checked: self._rebuild_all_project_children())
         self.node_network_page.forget_requested.connect(self._on_forget_requested)
+        self.node_network_page.set_default_gateway_requested.connect(self._on_set_default_gateway_requested)
 
         self.node_detail_page = NodeDetailPage()
         self.node_detail_page.rename_requested.connect(self._on_rename_requested)
@@ -516,6 +526,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No port selected", "Select a serial port first.")
             return
 
+        self._connecting_via_network = False
         self.client = GatewayClient(port)
         self.client.event_received.connect(self._on_event_received)
         self.client.raw_line.connect(self._on_raw_line)
@@ -549,6 +560,44 @@ class MainWindow(QMainWindow):
         self._verify_timer.start(VERIFY_TIMEOUT_MS)
         self._poll_timer.start(POLL_INTERVAL_MS)
 
+    def _try_default_gateway_on_startup(self):
+        """Called once from __init__, after the UI is built but before the
+        user has touched anything - if a "Set As Default Gateway" IP was
+        ever remembered (see settings.py), try it automatically rather
+        than making the user click Connect and pick a USB port every
+        single launch. Silently falls through to the normal idle state
+        (manual USB selection still works exactly as before) if nothing's
+        there or nothing answers - see _on_verify_timeout/
+        _on_client_disconnected's own _connecting_via_network branches for
+        where that quiet fallback actually happens."""
+        default_ip = get_default_gateway_ip()
+        if not default_ip:
+            self.statusBar().showMessage("No default gateway set - select a USB port to connect manually")
+            return
+        self._log(f"Trying default gateway {default_ip}...")
+        self._connect_network(default_ip)
+
+    def _connect_network(self, host: str):
+        self._connecting_via_network = True
+        self.client = NetworkGatewayClient(host)
+        self.client.event_received.connect(self._on_event_received)
+        self.client.raw_line.connect(self._on_raw_line)
+        self.client.error.connect(self._on_client_error)
+        self.client.disconnected.connect(self._on_client_disconnected)
+        self.client.start()
+
+        self._connected_port = host
+        self._verified = False
+        self._set_connected_ui(True)
+        self.dashboard_page.set_mac(None)  # no OS-reported serial number over a network connection
+
+        self.dashboard_page.set_connection_status(f"Connecting to {host} - verifying it's a gateway...")
+        self.statusBar().showMessage(f"Connecting to {host}...")
+
+        self.client.send_command({"cmd": "hello"})
+        self._verify_timer.start(VERIFY_TIMEOUT_MS)
+        self._poll_timer.start(POLL_INTERVAL_MS)
+
     def _disconnect(self):
         if self.client is not None:
             self.client.stop()
@@ -556,10 +605,22 @@ class MainWindow(QMainWindow):
         self._verify_timer.stop()
 
     def _on_client_disconnected(self):
+        was_connecting_via_network = self._connecting_via_network
+        already_verified = self._verified
         self.client = None
         self._connected_port = None
         self._verified = False
+        self._connecting_via_network = False
         self._set_connected_ui(False)
+        if was_connecting_via_network and not already_verified:
+            # Expected right now, not an error - see this file's own
+            # NetworkGatewayClient import comment and the module-level note
+            # in network_client.py: no device yet runs the TCP gateway
+            # server this would need to actually succeed against. Quiet
+            # fallback to the normal manual-USB idle state, no dialog.
+            self.statusBar().showMessage("No Gateway Discovered - select a USB port to connect manually")
+            self._log("No network gateway found at the default IP - select a USB port to connect manually.")
+            return
         self.statusBar().showMessage("Not connected")
         self._log("Disconnected.")
 
@@ -568,6 +629,10 @@ class MainWindow(QMainWindow):
 
     def _on_verify_timeout(self):
         if self.client is None or self._verified:
+            return
+        if self._connecting_via_network:
+            self._log(f"No response from {self._connected_port} - not a reachable gateway.")
+            self._disconnect()
             return
         port = self.port_combo.currentData()
         self._log(f"No response from {port} that looks like an RTS ESP-NOW Gateway - disconnecting.")
@@ -677,6 +742,10 @@ class MainWindow(QMainWindow):
         # up within one round trip instead of up to POLL_INTERVAL_MS later.
         self.known_devices.pop(mac, None)
         self.node_network_page.remove_device(mac)
+
+    def _on_set_default_gateway_requested(self, ip: str):
+        set_default_gateway_ip(ip)
+        self._log(f"Default gateway set to {ip} - will be tried automatically on the next launch.")
         self._poll_gateway()
 
     def _on_poll_registers_requested(self, mac: str):
@@ -827,9 +896,13 @@ class MainWindow(QMainWindow):
             # comment in _on_connect_clicked.
             self._verified = True
             self._verify_timer.stop()
-            port = self.port_combo.currentData()
-            self.dashboard_page.set_connection_status(f"Connected to {port}")
-            self.statusBar().showMessage(f"Connected to {port}")
+            self._connecting_via_network = False
+            # self._connected_port, not the USB port combo's current
+            # selection - the latter is meaningless (and possibly stale/
+            # wrong) for a NetworkGatewayClient connection, which was
+            # never chosen from that dropdown at all.
+            self.dashboard_page.set_connection_status(f"Connected to {self._connected_port}")
+            self.statusBar().showMessage(f"Connected to {self._connected_port}")
             self._log("Confirmed: this is an RTS ESP-NOW Gateway.")
 
         if event == "hello":

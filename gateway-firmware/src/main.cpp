@@ -23,8 +23,18 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <Update.h>
 #include <esp_now.h>
+#include <esp_system.h>  // esp_reset_reason() - System Information page
 #include <esp_wifi.h>
+
+#if defined(BOARD_GATEWAY_ATOMS3_POE)
+#include <M5_Ethernet.h>
+#include <SPI.h>
+#include <utility/w5100.h>  // for W5100.init() directly - see gateway_ethernet_begin()'s own comment
+#include "secrets.h"         // GATEWAY_WIFI_SSID/PASSWORD - WiFi fallback only, gitignored
+#include "rtslogo.h"          // RTS logo, served at /logo.gif by the HTTP status page below
+#endif
 
 #include "rtsnow_protocol.h"
 
@@ -191,6 +201,13 @@ namespace
         return true;
     }
 
+#if defined(BOARD_GATEWAY_ATOMS3_POE)
+    // Defined much later in this file (with the rest of the Ethernet/TCP
+    // server code) - forward-declared here since drain_output_queue()
+    // below needs to call it well before its own definition.
+    void broadcast_line_to_tcp_clients(const String &line);
+#endif
+
     // ---- Deferred Serial output ----
     //
     // esp_now_register_recv_cb's callback (on_espnow_recv and everything it
@@ -244,6 +261,14 @@ namespace
             if (!has)
                 break;
             Serial.println(line);
+#if defined(BOARD_GATEWAY_ATOMS3_POE)
+            // events/acks are already ID-tagged or inherently public data
+            // (hello/known_devices/heartbeats) - a TCP client seeing an ack
+            // that isn't its own and ignoring it is no different from two
+            // USB clients existing today, so no protocol change needed to
+            // broadcast the same line to every connected TCP client too.
+            broadcast_line_to_tcp_clients(line);
+#endif
         }
     }
 
@@ -624,6 +649,23 @@ namespace
     uint32_t s_last_gateway_announce_ms = 0;
     constexpr uint32_t kGatewayAnnounceIntervalMs = 10000; // matches rtsnow_node.cpp's own default heartbeatIntervalMs
 
+#if defined(BOARD_GATEWAY_ATOMS3_POE)
+    // Forward declarations only - defined with the rest of the Ethernet/
+    // WiFi-fallback state further down this file (with
+    // gateway_ethernet_begin() and friends); needed here since
+    // send_gateway_announce_if_due() reads them and is defined earlier in
+    // the file than that section. Mutually exclusive by construction -
+    // see setup()'s own comment - never both true at once.
+    extern bool s_eth_connected;
+    extern bool s_wifi_connected;
+    // Forward declaration only too - defined with the rest of the TCP
+    // client-array state further down this file; self_ota_begin() below
+    // calls this (guarded the same way) since starting a new OTA transfer
+    // should always get the gateway's full attention, not compete with
+    // whatever else happens to be connected over the same transport.
+    void drop_other_tcp_clients();
+#endif
+
     void send_gateway_announce_if_due()
     {
         uint32_t now = millis();
@@ -634,10 +676,37 @@ namespace
         RTSNOW_DeviceIdentity id{};
         id.deviceID = local_device_id();
         strncpy(id.projectName, "RTSNow", sizeof(id.projectName) - 1);
-        strncpy(id.deviceTypeName, "Gateway", sizeof(id.deviceTypeName) - 1);
+        // Hyphen-free to match EthernetGateway's own naming style (see
+        // node_atoms3_poe's main_atom_node.cpp) now that there are two
+        // kinds of gateway on the mesh - the desktop app's device table
+        // maps both back to a hyphenated display label. Which literal
+        // string depends on which gateway hardware this binary was built
+        // for (BOARD_GATEWAY_ATOMS3_POE only defined for the
+        // m5stack-atoms3_poe_gateway env - see this file's own Ethernet
+        // section) - both share this function/file, so the string can't be
+        // a single compile-time constant.
+#if defined(BOARD_GATEWAY_ATOMS3_POE)
+        strncpy(id.deviceTypeName, "EthernetGateway", sizeof(id.deviceTypeName) - 1);
+#else
+        strncpy(id.deviceTypeName, "UsbGateway", sizeof(id.deviceTypeName) - 1);
+#endif
         strncpy(id.friendlyName, "Gateway", sizeof(id.friendlyName) - 1);
         id.firmwareVersionMajor = 1;
+#if defined(BOARD_GATEWAY_ATOMS3_POE)
+        // This variant genuinely has an IP (Ethernet/W5500) unlike the USB
+        // dongle - report it so the desktop app's Known Devices table shows
+        // something real instead of a permanent blank, once s_eth_connected
+        // - or, lacking that, whatever WiFi fallback landed (see setup()'s
+        // own comment; the two are never both true at once).
+        if (s_eth_connected)
+            id.ipv4Address = static_cast<uint32_t>(Ethernet.localIP());
+        else if (s_wifi_connected)
+            id.ipv4Address = static_cast<uint32_t>(WiFi.localIP());
+        else
+            id.ipv4Address = 0;
+#else
         id.ipv4Address = 0; // this gateway has no IP of its own in the RTS-NOW sense - it's the ESP-NOW side, not a node with its own Modbus/HTTP surface
+#endif
         send_broadcast(RTSNOW_ANNOUNCE, &id, sizeof(id));
     }
 
@@ -1138,6 +1207,174 @@ namespace
         return nullptr;
     }
 
+    // ---- Firmware update - RECEIVING side (this gateway being flashed,
+    // not pushing to a node) ----
+    //
+    // Every RTS-NOW device should be reachable/updatable over the same
+    // protocol, gateways included - not just nodes. Two independent entry
+    // points share this same core (only one physical OTA partition
+    // exists, so both must agree on the same in-progress-transfer state
+    // or risk corrupting each other's writes):
+    //   - ESP-NOW (below): ported directly from rtsnow_node.cpp's
+    //     onEspNowRecv/rtsnowNodeLoop, the exact mechanism already proven
+    //     live (including through a relay) for regular nodes. Any device
+    //     already capable of pushing ESP-NOW OTA to a node (the existing
+    //     do_ota_*_send functions below, driven by the desktop app's
+    //     EspNowOtaTransfer) can push it to this gateway's MAC exactly
+    //     the same way - no new desktop-app code needed for that path.
+    //   - TCP (handle_ota_*_command, near handle_json_line): same
+    //     Update.begin/write/end core, driven directly over the already-
+    //     connected JSON-lines socket instead of ESP-NOW - useful when
+    //     this gateway IS the connection a desktop app already has open,
+    //     rather than something being reached through the mesh.
+    bool s_selfOtaActive = false;
+    uint32_t s_selfOtaTotalChunks = 0;
+    uint32_t s_selfOtaNextExpectedIndex = 0;
+
+    // Common core, called from both entry points. outError points at a
+    // caller-owned buffer (RTSNOW_OtaAck::message for ESP-NOW, a local
+    // buffer for TCP) - left untouched on success.
+    bool self_ota_begin(uint32_t totalSize, uint32_t totalChunks, const char *md5, char *outError, size_t outErrorLen)
+    {
+        if (s_selfOtaActive)
+            Update.abort();  // a fresh START while one was already active - trust the new one, not stale state
+        bool began = Update.begin(totalSize);
+        if (!began)
+        {
+            snprintf(outError, outErrorLen, "Update.begin failed");
+            return false;
+        }
+        if (md5 != nullptr && strlen(md5) == 32)  // only trust it if it actually looks like a real MD5 hex string
+            Update.setMD5(md5);
+        s_selfOtaActive = true;
+        s_selfOtaTotalChunks = totalChunks;
+        s_selfOtaNextExpectedIndex = 0;
+#if defined(BOARD_GATEWAY_ATOMS3_POE)
+        // A fresh transfer just started - drop every other TCP connection
+        // on whichever transport is active (keeping only the one that
+        // issued this exact ota_start, if it came in over TCP - see
+        // drop_other_tcp_clients()'s own comment) so nothing else
+        // competes for CPU/socket resources while this gateway writes its
+        // own flash. If this call came from the ESP-NOW entry point
+        // instead (no TCP client involved at all), every TCP connection
+        // gets dropped - there's no "self" to preserve in that case.
+        drop_other_tcp_clients();
+#endif
+        Serial.printf("Self-OTA start accepted (size=%u, %u chunks)\n", totalSize, totalChunks);
+        return true;
+    }
+
+    bool self_ota_write_chunk(uint32_t index, const uint8_t *data, uint16_t length)
+    {
+        if (!s_selfOtaActive || index != s_selfOtaNextExpectedIndex)
+            return false;
+        size_t written = Update.write(const_cast<uint8_t *>(data), length);
+        bool ok = written == length;
+        if (ok)
+            s_selfOtaNextExpectedIndex++;
+        return ok;
+    }
+
+    bool self_ota_end(char *outError, size_t outErrorLen)
+    {
+        if (!s_selfOtaActive || s_selfOtaNextExpectedIndex != s_selfOtaTotalChunks)
+        {
+            snprintf(outError, outErrorLen, "incomplete transfer");
+            return false;
+        }
+        bool success = Update.end(true);
+        if (!success)
+            snprintf(outError, outErrorLen, "Update.end failed: %s", Update.errorString());
+        else
+        {
+            Serial.println("Self-OTA complete - restarting");
+            delay(100);  // let the ack/response actually get out before the restart
+            ESP.restart();
+            // ESP.restart() does not return - nothing below this point on
+            // the success path.
+        }
+        return success;
+    }
+
+    void self_ota_abort()
+    {
+        if (s_selfOtaActive)
+        {
+            Update.abort();
+            s_selfOtaActive = false;
+            Serial.println("Self-OTA aborted by sender");
+        }
+    }
+
+    // ---- ESP-NOW entry point - deferred processing ----
+    //
+    // on_espnow_recv() below just flags + copies the small fixed-size
+    // payload for each message; service_self_ota() (called from loop())
+    // does the actual self_ota_*() calls, keeping flash access out of the
+    // ESP-NOW receive callback's task context - same deferred pattern
+    // rtsnow_node.cpp uses for a node's own receiving side.
+    bool s_selfOtaStartPending = false;
+    RTSNOW_OtaStart s_pendingSelfOtaStart;
+    uint8_t s_pendingSelfOtaStartMac[6];
+    uint32_t s_pendingSelfOtaStartRequesterId = 0xFFFFFFFF;
+
+    bool s_selfOtaChunkPending = false;
+    RTSNOW_OtaChunk s_pendingSelfOtaChunk;
+    uint8_t s_pendingSelfOtaChunkMac[6];
+    uint32_t s_pendingSelfOtaChunkRequesterId = 0xFFFFFFFF;
+
+    bool s_selfOtaEndPending = false;
+    uint8_t s_pendingSelfOtaEndMac[6];
+    uint32_t s_pendingSelfOtaEndRequesterId = 0xFFFFFFFF;
+
+    bool s_selfOtaAbortPending = false;
+
+    void service_self_ota()
+    {
+        if (s_selfOtaStartPending)
+        {
+            s_selfOtaStartPending = false;
+            ensure_peer(s_pendingSelfOtaStartMac);
+            char md5[33];
+            memcpy(md5, s_pendingSelfOtaStart.md5, sizeof(md5));
+            md5[32] = '\0';
+            RTSNOW_OtaAck ack{};
+            bool began = self_ota_begin(s_pendingSelfOtaStart.totalSize, s_pendingSelfOtaStart.totalChunks, md5,
+                                        ack.message, sizeof(ack.message));
+            ack.ok = began ? 1 : 0;
+            send_to(s_pendingSelfOtaStartMac, RTSNOW_OTA_START_ACK, &ack, sizeof(ack), s_pendingSelfOtaStartRequesterId);
+        }
+
+        if (s_selfOtaChunkPending)
+        {
+            s_selfOtaChunkPending = false;
+            RTSNOW_OtaChunkAck ack{};
+            ack.index = s_pendingSelfOtaChunk.index;
+            ack.ok = self_ota_write_chunk(s_pendingSelfOtaChunk.index, s_pendingSelfOtaChunk.data,
+                                          s_pendingSelfOtaChunk.length)
+                         ? 1
+                         : 0;
+            send_to(s_pendingSelfOtaChunkMac, RTSNOW_OTA_CHUNK_ACK, &ack, sizeof(ack), s_pendingSelfOtaChunkRequesterId);
+        }
+
+        if (s_selfOtaEndPending)
+        {
+            s_selfOtaEndPending = false;
+            RTSNOW_OtaAck ack{};
+            bool success = self_ota_end(ack.message, sizeof(ack.message));
+            ack.ok = success ? 1 : 0;
+            // self_ota_end() already restarted the chip on success - this
+            // send only actually goes out on the failure path.
+            send_to(s_pendingSelfOtaEndMac, RTSNOW_OTA_END_ACK, &ack, sizeof(ack), s_pendingSelfOtaEndRequesterId);
+        }
+
+        if (s_selfOtaAbortPending)
+        {
+            s_selfOtaAbortPending = false;
+            self_ota_abort();
+        }
+    }
+
     // ---- Firmware update over ESP-NOW (see RTSNOW_OTA_START's own
     // comment in rtsnow_protocol.h) ----
     //
@@ -1254,6 +1491,941 @@ namespace
         doc["channel"] = channel;
         emit_json(doc);
     }
+
+#if defined(BOARD_GATEWAY_ATOMS3_POE)
+    // Defined later in this file (both parse a complete line the same way
+    // regardless of which transport - USB serial or this TCP server - it
+    // arrived on); forward-declared here since service_tcp_client() below
+    // needs to call them well before their own definitions.
+    void handle_command(char *line);
+    void handle_json_line(char *line);
+
+    // ---- Ethernet (W5500/Atomic PoE Base) + TCP JSON-lines server ----
+    //
+    // Reuses RTSNow-SPI-CCP's own NetworkManager.cpp bring-up sequence
+    // (same board pairing, pins confirmed there against two independent
+    // real-hardware sources), including the one real fix that took an
+    // entire debugging session to find: EthernetClass::init(sspin) only
+    // sets the CS pin - it does NOT probe the chip. hardwareStatus() only
+    // ever returns a cached W5100.getChip() value, populated ONLY by
+    // calling W5100.init() (a different, same-named function, W5100Class
+    // not EthernetClass) - skipping that call means every hardwareStatus()
+    // check reads stale/zeroed data, forever, even with the chip working
+    // perfectly. No WiFi-AP fallback here at all (see gateway_ethernet_
+    // begin()'s own call site in setup() for why not).
+    constexpr gpio_num_t kEthSck = GPIO_NUM_5;
+    constexpr gpio_num_t kEthMiso = GPIO_NUM_7;
+    constexpr gpio_num_t kEthMosi = GPIO_NUM_8;
+    constexpr gpio_num_t kEthCs = GPIO_NUM_6;
+    bool s_eth_connected = false;
+    bool s_wifi_connected = false;  // WiFi fallback only - set once at boot, see setup()
+
+    bool gateway_ethernet_begin(uint32_t linkTimeoutMs = 15000)
+    {
+        uint8_t mac[6];
+        WiFi.macAddress(mac);  // WiFi.mode(WIFI_STA) already ran earlier in setup()
+        SPI.begin(kEthSck, kEthMiso, kEthMosi, -1);
+        Ethernet.init(kEthCs);
+        W5100.init();  // the actual detection - do not skip this, see comment above
+        if (Ethernet.hardwareStatus() != EthernetW5500)
+        {
+            Serial.println("Ethernet: W5500 not detected - check PoE Base seating.");
+            return false;
+        }
+        uint32_t start = millis();
+        while (Ethernet.linkStatus() != LinkON && millis() - start < linkTimeoutMs)
+            delay(100);
+        if (Ethernet.linkStatus() != LinkON)
+        {
+            Serial.println("Ethernet: W5500 detected, but no link - check cable/switch.");
+            return false;
+        }
+        if (Ethernet.begin(mac) == 0)
+        {
+            Serial.println("Ethernet: DHCP failed.");
+            return false;
+        }
+        Serial.printf("Ethernet: connected, IP=%s\n", Ethernet.localIP().toString().c_str());
+        return true;
+    }
+
+    // Real constraint, found while verifying against the vendored library:
+    // M5_Ethernet's own M5_Ethernet.h hardcodes MAX_SOCK_NUM to 2 (not
+    // #ifndef-guarded, so a build-flag override doesn't work). With only 2
+    // hardware sockets total - shared by this listener, any established
+    // client, and Ethernet.maintain()'s own transient DHCP-renewal socket -
+    // this library build reliably sustains one actively-connected TCP
+    // client, not true concurrency - genuinely capped, not just an
+    // arbitrary choice, unlike the WiFi constant below.
+    constexpr uint8_t kMaxEthTcpClients = 1;
+    // WiFi (ESP32's native lwIP) has no equivalent hardware ceiling - this
+    // used to share the Ethernet constant above (=1) for no real reason,
+    // which meant the desktop app's own long-lived monitoring connection
+    // silently starved out any other WiFi TCP client, including an OTA
+    // push tool trying to connect at the same time (confirmed live: an
+    // `ota_start` attempt got an immediate connection reset while the
+    // desktop app was connected). Room for a few concurrent clients here
+    // costs nothing real and avoids that entirely for the common case.
+    constexpr uint8_t kMaxWifiTcpClients = 4;
+    constexpr uint16_t kGatewayTcpPort = 5055;
+
+    // Templated over EthernetClient/WiFiClient (both expose the same
+    // available()/read()/write()/connected() shape in the Arduino core, no
+    // common virtual base needed) - Ethernet and WiFi each get their own
+    // listener + client slot(s) below, serviced by the same code either
+    // way, active one at a time per gateway_ethernet_begin()'s own
+    // Ethernet-priority-then-WiFi-fallback decision in setup().
+    template <typename ClientT>
+    struct TcpClientState
+    {
+        ClientT client;
+        // Must fit an ota_chunk line: a 2048-byte chunk hex-encodes to
+        // 4096 chars, plus ~60 bytes of JSON overhead - see
+        // handle_ota_chunk_command()'s own comment on why this TCP path
+        // isn't stuck at ESP-NOW's 220-byte/640-line sizing.
+        char lineBuf[4300];
+        size_t lineLen = 0;
+        void reset() { lineLen = 0; }
+    };
+    EthernetServer s_tcp_server(kGatewayTcpPort);
+    TcpClientState<EthernetClient> s_tcp_clients[kMaxEthTcpClients];
+    bool s_tcp_server_started = false;
+
+    WiFiServer s_wifi_tcp_server(kGatewayTcpPort);
+    TcpClientState<WiFiClient> s_wifi_tcp_clients[kMaxWifiTcpClients];
+    bool s_wifi_tcp_server_started = false;
+
+    // Identifies which TCP client slot (if any) is currently having a line
+    // dispatched from it - set/cleared around handle_json_line()/
+    // handle_command() below, read by drop_other_tcp_clients() (called
+    // from self_ota_begin()) to know which single connection to spare
+    // when a fresh OTA transfer needs everything else out of the way.
+    // Tagged by the TcpClientState slot's own address (unique and stable
+    // for the object's lifetime) rather than the ClientT object itself,
+    // since Ethernet and WiFi slots are two different C++ types with no
+    // common base to point at generically. nullptr whenever nothing is
+    // mid-dispatch - correctly means "no TCP client to spare" if an OTA
+    // starts from the ESP-NOW entry point instead (see that comment).
+    void *s_currentTcpClientTag = nullptr;
+
+    template <typename ClientT>
+    void service_tcp_client(TcpClientState<ClientT> &st)
+    {
+        while (st.client.available())
+        {
+            char c = static_cast<char>(st.client.read());
+            if (c == '\r')
+                continue;
+            if (c == '\n')
+            {
+                st.lineBuf[st.lineLen] = '\0';
+                if (st.lineLen > 0)
+                {
+                    char *trimmed = st.lineBuf;
+                    while (*trimmed == ' ' || *trimmed == '\t')
+                        trimmed++;
+                    s_currentTcpClientTag = static_cast<void *>(&st);
+                    if (*trimmed == '{')
+                        handle_json_line(trimmed);
+                    else
+                        handle_command(st.lineBuf);
+                    s_currentTcpClientTag = nullptr;
+                }
+                st.lineLen = 0;
+                continue;
+            }
+            if (st.lineLen + 1 < sizeof(st.lineBuf))
+                st.lineBuf[st.lineLen++] = c;
+            // else: line too long - silently drop the overflow byte rather
+            // than corrupt framing, same policy as service_serial().
+        }
+    }
+
+    // Shared Ethernet/WiFi polling body - which one ever actually runs is
+    // decided by poll_tcp_server() below staying strictly if/else on
+    // s_eth_connected vs s_wifi_connected, never both, matching
+    // setup()'s own Ethernet-priority-then-WiFi-fallback decision (see
+    // that section's own comment for why running both at once would be
+    // a real correctness problem, not just wasteful).
+    //
+    // When every slot is already full, this EVICTS the oldest connection
+    // (slot 0 - slots fill in order and this array is small/short-lived,
+    // so a real LRU isn't worth the bookkeeping) rather than rejecting
+    // the new one outright. Real problem this fixes: a long-lived client
+    // (the desktop app's own monitoring connection) used to permanently
+    // starve out any other same-transport connection attempt, including
+    // an OTA push tool trying to connect - confirmed live, an `ota_start`
+    // attempt got an immediate connection reset while the desktop app
+    // happened to be connected. Whoever connects LAST now always
+    // eventually gets in; an evicted client (e.g. the desktop app) just
+    // needs to reconnect, same as if the gateway had rebooted.
+    //
+    // Matters most for Ethernet, where kMaxEthTcpClients is a genuine
+    // hardware ceiling (M5_Ethernet's W5500 completes a TCP handshake in
+    // hardware before the sketch ever calls accept(), so an incoming
+    // connection nobody claims permanently occupies one of only 2 total
+    // hardware sockets until it times out on its own - confirmed live
+    // separately, a leaked never-serviced connection made that server
+    // refuse everything for several minutes) - but applying the same
+    // policy on WiFi too costs nothing and stays consistent.
+    template <typename ServerT, typename ClientT>
+    void poll_tcp_clients(ServerT &server, TcpClientState<ClientT> *clients, uint8_t clientCount,
+                          bool &serverStarted, const char *transportLabel)
+    {
+        if (!serverStarted)
+        {
+            server.begin();
+            serverStarted = true;
+            Serial.printf("TCP JSON server (%s) listening on port %u\n", transportLabel, kGatewayTcpPort);
+        }
+        bool slotClaimed = false;
+        for (uint8_t i = 0; i < clientCount; i++)
+        {
+            if (!clients[i].client || !clients[i].client.connected())
+            {
+                ClientT incoming = server.accept();
+                if (incoming)
+                {
+                    clients[i].client = incoming;
+                    clients[i].reset();
+                    Serial.printf("TCP client connected (%s).\n", transportLabel);
+                }
+                slotClaimed = true;
+                break;
+            }
+        }
+        if (!slotClaimed)
+        {
+            ClientT incoming = server.accept();
+            if (incoming)
+            {
+                Serial.printf("TCP (%s): all %u slot(s) full - evicting the oldest connection for this new one\n",
+                              transportLabel, clientCount);
+                clients[0].client.stop();
+                clients[0].client = incoming;
+                clients[0].reset();
+            }
+        }
+
+        for (uint8_t i = 0; i < clientCount; i++)
+            if (clients[i].client && clients[i].client.connected())
+                service_tcp_client(clients[i]);
+    }
+
+    // See self_ota_begin()'s own call site and s_currentTcpClientTag's own
+    // comment - drops every TCP connection on whichever transport is
+    // active except the one (if any) whose slot address matches the
+    // current tag, so a fresh OTA transfer always gets the gateway's full
+    // attention instead of competing with, say, the desktop app's own
+    // long-lived monitoring connection.
+    void drop_other_tcp_clients()
+    {
+        if (s_eth_connected)
+        {
+            for (uint8_t i = 0; i < kMaxEthTcpClients; i++)
+            {
+                if (static_cast<void *>(&s_tcp_clients[i]) == s_currentTcpClientTag)
+                    continue;
+                if (s_tcp_clients[i].client)
+                {
+                    s_tcp_clients[i].client.stop();
+                    s_tcp_clients[i].reset();
+                }
+            }
+        }
+        else if (s_wifi_connected)
+        {
+            for (uint8_t i = 0; i < kMaxWifiTcpClients; i++)
+            {
+                if (static_cast<void *>(&s_wifi_tcp_clients[i]) == s_currentTcpClientTag)
+                    continue;
+                if (s_wifi_tcp_clients[i].client)
+                {
+                    s_wifi_tcp_clients[i].client.stop();
+                    s_wifi_tcp_clients[i].reset();
+                }
+            }
+        }
+    }
+
+    void poll_tcp_server()
+    {
+        // Strictly one transport at a time, never both - matches
+        // s_eth_connected/s_wifi_connected themselves already being
+        // mutually exclusive (see setup()'s own comment).
+        if (s_eth_connected)
+            poll_tcp_clients(s_tcp_server, s_tcp_clients, kMaxEthTcpClients, s_tcp_server_started, "Ethernet");
+        else if (s_wifi_connected)
+            poll_tcp_clients(s_wifi_tcp_server, s_wifi_tcp_clients, kMaxWifiTcpClients, s_wifi_tcp_server_started,
+                              "WiFi");
+    }
+
+    // M5_Ethernet's socketSend() silently clamps any single write over
+    // ~2KB (the W5500's per-socket TX buffer) while still reporting the
+    // full size as sent - proven live in RTSNow-SPI-CCP's PoeStatusServer
+    // while serving an embedded logo image over this same library. A
+    // known_devices line can comfortably exceed that with enough peers, so
+    // every write here goes out in small, explicitly-checked chunks rather
+    // than trusting one write() call to either succeed completely or fail
+    // loudly.
+    constexpr size_t kTcpChunkSize = 512;
+
+    template <typename ClientT>
+    void write_line_to_tcp_client(ClientT &client, const String &line)
+    {
+        const uint8_t *data = reinterpret_cast<const uint8_t *>(line.c_str());
+        size_t total = line.length();
+        size_t sent = 0;
+        while (sent < total)
+        {
+            size_t chunk = (total - sent) < kTcpChunkSize ? (total - sent) : kTcpChunkSize;
+            size_t written = client.write(data + sent, chunk);
+            if (written == 0)
+                return;  // client gone - service_tcp_client's own connected() check cleans it up next poll
+            sent += written;
+        }
+        client.write(reinterpret_cast<const uint8_t *>("\n"), 1);
+    }
+
+    void broadcast_line_to_tcp_clients(const String &line)
+    {
+        // Only one of these two loops ever actually finds a connected
+        // client in practice (Ethernet and WiFi are never both up - see
+        // poll_tcp_server()'s own comment) - written as two loops rather
+        // than one dispatching on s_eth_connected/s_wifi_connected so a
+        // client that's mid-disconnect during the transport decision's
+        // own transition doesn't miss an event either way.
+        for (uint8_t i = 0; i < kMaxEthTcpClients; i++)
+            if (s_tcp_clients[i].client && s_tcp_clients[i].client.connected())
+                write_line_to_tcp_client(s_tcp_clients[i].client, line);
+        for (uint8_t i = 0; i < kMaxWifiTcpClients; i++)
+            if (s_wifi_tcp_clients[i].client && s_wifi_tcp_clients[i].client.connected())
+                write_line_to_tcp_client(s_wifi_tcp_clients[i].client, line);
+    }
+#endif
+
+#if defined(BOARD_GATEWAY_ATOMS3_POE)
+    // ---- HTML status page (port 80) - separate from the JSON protocol
+    // server above (port 5055, for the desktop app); this one's for a
+    // human with a browser. Structurally a port of RTSNow-SPI-CCP's own
+    // PoeStatusServer.cpp (same board, same dual-transport situation,
+    // proven design) - adapted here to show gateway state (known devices,
+    // ESP-NOW channel) instead of dryer registers. No embedded logo image
+    // (that'd mean duplicating rts_gif/rtslogo.h across repos for a
+    // cosmetic-only page) - plain text/table content only.
+    constexpr uint16_t kHttpPort = 80;
+    constexpr uint32_t kHttpClientTimeoutMs = 3000;
+
+    template <typename ClientT>
+    struct HttpListenerState
+    {
+        ClientT client;
+        char requestLine[160] = {0};
+        size_t requestLineLen = 0;
+        bool requestLineDone = false;
+        uint32_t clientStartMs = 0;
+        void reset()
+        {
+            requestLineLen = 0;
+            requestLineDone = false;
+        }
+    };
+
+    EthernetServer s_http_eth_server(kHttpPort);
+    WiFiServer s_http_wifi_server(kHttpPort);
+    HttpListenerState<EthernetClient> s_http_eth_state;
+    HttpListenerState<WiFiClient> s_http_wifi_state;
+
+    template <typename ClientT>
+    void write_http_style(ClientT &client)
+    {
+        // Same chrome as RTSNow-SPI-CCP's PoeStatusServer.cpp (logo/title
+        // header, left sidebar nav, section box styling) - this is the same
+        // physical board family and the same "Digi gateway admin UI" look
+        // that page deliberately borrowed, so this page matches it exactly
+        // rather than introducing a second, different visual language.
+        client.println("<style>"
+                       "body{font-family:-apple-system,Arial,sans-serif;margin:0;background:#fff;color:#222;}"
+                       "#topbar{display:flex;align-items:center;gap:16px;padding:12px 20px;}"
+                       "#topbar img{width:100px;height:100px;}"
+                       "#topbar h1{font-size:1.4em;margin:0;color:#001a70;}"
+                       "#layout{display:flex;}"
+                       "#sidebar{width:170px;flex-shrink:0;padding:16px 12px;border-right:1px solid #ddd;}"
+                       "#sidebar a{display:block;color:#0645ad;text-decoration:none;font-size:0.92em;margin-bottom:8px;}"
+                       "#sidebar a:hover{text-decoration:underline;}"
+                       "#sidebar .navhead{font-weight:700;color:#222;margin:14px 0 4px;font-size:0.9em;}"
+                       "#main{flex:1;padding:16px 20px;min-width:0;}"
+                       ".box{border:1px solid #b9c9e8;margin-bottom:14px;border-radius:2px;overflow:hidden;}"
+                       ".box h2{background:#001a70;color:#fff;font-size:1em;margin:0;padding:8px 12px;}"
+                       ".box .body{padding:10px 14px;}"
+                       ".box .body p{margin:4px 0;font-size:0.92em;}"
+                       "table{border-collapse:collapse;width:100%;font-size:0.9em;}"
+                       "th{text-align:left;color:#001a70;border-bottom:2px solid #b9c9e8;padding:5px 8px;}"
+                       "td{border-bottom:1px solid #eee;padding:5px 8px;}"
+                       // Missing this is exactly why the mesh RSSI bars
+                       // rendered garbled/overlapping - the ▂▄▆█▁ glyphs
+                       // are block-drawing characters that only line up
+                       // cleanly at a fixed advance width; a proportional
+                       // body font renders them at inconsistent widths.
+                       // Matches PoeStatusServer.cpp's own td.rssi rule.
+                       "td.rssi{font-family:monospace;letter-spacing:1px;}"
+                       "#sidebar a.active{font-weight:700;text-decoration:underline;}"
+                       "button.reboot-btn{background:#001a70;color:#fff;border:none;border-radius:2px;"
+                       "padding:4px 10px;font-size:0.85em;cursor:pointer;}"
+                       "button.reboot-btn:disabled{background:#9aa5c4;cursor:default;}"
+                       // A row being rebooted greys out until a fresh
+                       // heartbeat proves the device is back - see
+                       // rebootDevice()/refresh()'s own comment for the
+                       // exact "back up" heuristic.
+                       "tr.rebooting{opacity:0.45;}"
+                       "</style>");
+    }
+
+    template <typename ClientT>
+    void write_http_script(ClientT &client)
+    {
+        client.println("<script>"
+                       // Mirrors desktop-app/src/gateway/models.py's own
+                       // _DEVICE_TYPE_LABELS exactly - deviceTypeName
+                       // travels the wire as a terse, hyphen-free
+                       // identifier (see RTSNOW_DeviceIdentity's char[16]),
+                       // mapped to a friendlier label for display only in
+                       // both places that render it. No shared source
+                       // between this C++/JS page and that Python file -
+                       // keep both in sync by hand if this list changes.
+                       "var DEVICE_TYPE_LABELS={"
+                       "'UsbGateway':'USB-Gateway',"
+                       "'EthernetGateway':'Ethernet-Gateway',"
+                       "'RTSNow-UNADYN':'SPI-CCP'"
+                       "};"
+                       "function deviceTypeLabel(t){return DEVICE_TYPE_LABELS[t]||t;}"
+                       // Same 4-bar glyph + dBm thresholds as
+                       // PoeStatusServer.cpp's own rssiBars() and the
+                       // desktop app's rssi_bar_count()/format_rssi()
+                       // (node_network_page.py) - one shared visual
+                       // language for "what counts as a good link" across
+                       // every RTS-NOW surface, not a fourth independently
+                       // tuned scale.
+                       "function rssiBars(rssi){"
+                       "if(rssi===null||rssi===undefined)return '\xE2\x80\x93';"
+                       "var t=[-50,-60,-70,-80],f=['\xE2\x96\x82','\xE2\x96\x84','\xE2\x96\x86','\xE2\x96\x88'],bars=0;"
+                       "for(var i=0;i<t.length;i++)if(rssi>=t[i])bars++;"
+                       "var g='';"
+                       "for(var i=0;i<4;i++)g+=(i<bars?f[i]:'\xE2\x96\x81');"
+                       "return g+' '+rssi+' dBm';"
+                       "}"
+                       "function formatUptime(s){"
+                       "var d=Math.floor(s/86400);s%=86400;"
+                       "var h=Math.floor(s/3600);s%=3600;"
+                       "var m=Math.floor(s/60);s%=60;"
+                       "var parts=[];"
+                       "if(d>0)parts.push(d+'d');"
+                       "if(d>0||h>0)parts.push(h+'h');"
+                       "if(d>0||h>0||m>0)parts.push(m+'m');"
+                       "parts.push(s+'s');"
+                       "return parts.join(' ');"
+                       "}"
+                       "function el(id){return document.getElementById(id);}"
+                       // mac -> Date.now() at the moment Reboot was clicked
+                       // for it. A row stays greyed/disabled (see
+                       // refresh()'s own use of this) until a poll reports
+                       // an 'ago' smaller than how long it's been since the
+                       // click - that only happens once the device has
+                       // actually re-announced itself post-reboot, so it's
+                       // a real "back up and communicating" signal, not
+                       // just a fixed timeout guess.
+                       "var reboots={};"
+                       "function rebootDevice(mac,btn){"
+                       "if(btn)btn.disabled=true;"
+                       "reboots[mac]=Date.now();"
+                       "fetch('/api/reboot?mac='+mac).catch(function(){});"
+                       "refresh();"
+                       "}"
+                       // Rebooting the gateway itself, not some other known
+                       // device (see /api/reboot_self's own comment - no
+                       // mac involved, it always targets this gateway).
+                       // The fetch itself will almost always error out or
+                       // hang (the gateway drops off the network mid-
+                       // response as it restarts) - that's expected, not a
+                       // real failure, so both .then and .catch land on
+                       // the same "rebooting" message rather than trying
+                       // to distinguish a real error from the reboot
+                       // itself severing the connection.
+                       "function rebootSelf(btn){"
+                       "if(!confirm('Reboot this gateway now?'))return;"
+                       "btn.disabled=true;"
+                       "el('rebootSelfStatus').textContent='Rebooting...';"
+                       "fetch('/api/reboot_self').then(function(){},function(){});"
+                       "}"
+                       "function refresh(){"
+                       "fetch('/api/status').then(function(r){return r.json();}).then(function(d){"
+                       "if(el('uptime'))el('uptime').textContent=formatUptime(d.uptime);"
+                       "if(el('freeHeap'))el('freeHeap').textContent=d.freeHeap.toLocaleString()+' bytes';"
+                       "if(el('connStatus'))el('connStatus').textContent=d.connStatus;"
+                       "if(el('channel'))el('channel').textContent=d.channel;"
+                       "if(el('netDetails')){"
+                       "var net='';"
+                       "if(d.ethIp)net+='<p>Ethernet IP: '+d.ethIp+'</p>';"
+                       "if(d.wifiIp)net+='<p>WiFi IP: '+d.wifiIp+' (SSID: '+d.wifiSsid+')</p>';"
+                       "el('netDetails').innerHTML=net;"
+                       "}"
+                       "if(el('devicesBody')){"
+                       "var rows='';"
+                       "if(d.devices.length===0)rows='<tr><td colspan=\"8\">No devices heard yet</td></tr>';"
+                       "d.devices.forEach(function(p){"
+                       "var rebooting=false;"
+                       "if(reboots[p.mac]!==undefined){"
+                       "var elapsed=(Date.now()-reboots[p.mac])/1000;"
+                       "if(p.ago<elapsed)delete reboots[p.mac];"
+                       "else rebooting=true;"
+                       "}"
+                       "rows+='<tr class=\"'+(rebooting?'rebooting':'')+'\"><td>'+p.name+'</td><td>'+p.project+'</td><td>'+"
+                       "deviceTypeLabel(p.type)+'</td><td>'+p.mac+'</td><td>'+(p.ip||'-')+'</td><td class=\"rssi\">'+"
+                       "rssiBars(p.meshRssi)+'</td><td>'+p.ago+'s ago</td><td><button class=\"reboot-btn\" '+"
+                       "(rebooting?'disabled':'')+' onclick=\"rebootDevice(\\''+p.mac+'\\',this)\">Reboot</button></td></tr>';"
+                       "});"
+                       "el('devicesBody').innerHTML=rows;"
+                       "}"
+                       "}).catch(function(){});"
+                       "}"
+                       "refresh();"
+                       "setInterval(refresh,5000);"
+                       "</script>");
+    }
+
+    const char *reset_reason_str(esp_reset_reason_t reason)
+    {
+        switch (reason)
+        {
+        case ESP_RST_POWERON: return "Power-on";
+        case ESP_RST_EXT: return "External pin";
+        case ESP_RST_SW: return "Software reset (esp_restart)";
+        case ESP_RST_PANIC: return "Panic/exception";
+        case ESP_RST_INT_WDT: return "Interrupt watchdog";
+        case ESP_RST_TASK_WDT: return "Task watchdog";
+        case ESP_RST_WDT: return "Other watchdog";
+        case ESP_RST_DEEPSLEEP: return "Deep sleep wake";
+        case ESP_RST_BROWNOUT: return "Brownout";
+        case ESP_RST_SDIO: return "SDIO";
+        default: return "Unknown";
+        }
+    }
+
+    template <typename ClientT>
+    void write_http_nav_link(ClientT &client, const char *href, const char *label, const char *activePage)
+    {
+        if (strcmp(href, activePage) == 0)
+            client.printf("<a href=\"%s\" class=\"active\">%s</a>", href, label);
+        else
+            client.printf("<a href=\"%s\">%s</a>", href, label);
+    }
+
+    // Shared chrome for every real page (Home/Network/Known Devices/System
+    // Information all now have their own URL - replaces the old single-
+    // page-with-#anchors design, whose sidebar just said "On this page").
+    // activePage is one of the href values passed to write_http_nav_link
+    // below, used to bold/underline whichever page is currently showing.
+    template <typename ClientT>
+    void write_http_page_head(ClientT &client, const char *title, const char *activePage)
+    {
+        client.println("HTTP/1.1 200 OK");
+        client.println("Content-Type: text/html");
+        client.println("Connection: close");
+        client.println();
+        client.printf("<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+                      "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+                      "<title>%s</title>",
+                      title);
+        write_http_style(client);
+        client.println("</head><body>");
+        client.println("<div id=\"topbar\"><img src=\"/logo.gif\" alt=\"RTS\">"
+                       "<h1>RTS-NOW Gateway Status</h1></div>");
+        client.println("<div id=\"layout\">");
+        client.print("<div id=\"sidebar\">");
+        write_http_nav_link(client, "/", "Home", activePage);
+        write_http_nav_link(client, "/network", "Network", activePage);
+        write_http_nav_link(client, "/devices", "Known Devices", activePage);
+        write_http_nav_link(client, "/system", "System Information", activePage);
+        client.println("</div>");
+        client.println("<div id=\"main\">");
+    }
+
+    template <typename ClientT>
+    void write_http_page_foot(ClientT &client)
+    {
+        client.println("</div></div>");  // close #main, #layout
+        write_http_script(client);
+        client.println("</body></html>");
+    }
+
+    template <typename ClientT>
+    void write_http_home_page(ClientT &client)
+    {
+        write_http_page_head(client, "RTS-NOW Gateway - Home", "/");
+        client.println("<div class=\"box\"><h2>Device</h2><div class=\"body\">");
+        client.printf("<p><b>Gateway</b> (deviceID 0x%08X)</p>\n", local_device_id());
+        client.printf("<p>MAC address: %s</p>\n", WiFi.macAddress().c_str());
+        client.println("<p>Uptime: <span id=\"uptime\">-</span></p>");
+        client.println("<p>Free heap: <span id=\"freeHeap\">-</span></p>");
+        client.println("<p>Firmware: 1.0.0</p>");
+        client.println("<p>ESP-NOW channel: <span id=\"channel\">-</span></p>");
+        client.println("</div></div>");
+        write_http_page_foot(client);
+    }
+
+    template <typename ClientT>
+    void write_http_network_page(ClientT &client)
+    {
+        write_http_page_head(client, "RTS-NOW Gateway - Network", "/network");
+        client.println("<div class=\"box\"><h2>Network</h2><div class=\"body\">");
+        client.println("<p>Connection status: <b id=\"connStatus\">-</b></p>");
+        client.println("<div id=\"netDetails\"></div>");
+        client.println("</div></div>");
+        write_http_page_foot(client);
+    }
+
+    template <typename ClientT>
+    void write_http_devices_page(ClientT &client)
+    {
+        write_http_page_head(client, "RTS-NOW Gateway - Known Devices", "/devices");
+        client.println("<div class=\"box\"><h2>Known Devices</h2><div class=\"body\">");
+        client.println("<table><tr><th>Name</th><th>Project</th><th>Type</th><th>MAC</th><th>IP</th><th>Mesh</th>"
+                       "<th>Last heard</th><th>Action</th></tr><tbody id=\"devicesBody\"></tbody></table>");
+        client.println("</div></div>");
+        write_http_page_foot(client);
+    }
+
+    template <typename ClientT>
+    void write_http_system_page(ClientT &client)
+    {
+        write_http_page_head(client, "RTS-NOW Gateway - System Information", "/system");
+        client.println("<div class=\"box\"><h2>Gateway</h2><div class=\"body\">");
+        client.printf("<p><b>Gateway</b> (deviceID 0x%08X)</p>\n", local_device_id());
+        client.printf("<p>Board: %s</p>\n", BOARD_NAME);
+        client.printf("<p>MAC address: %s</p>\n", WiFi.macAddress().c_str());
+        client.println("<p>Uptime: <span id=\"uptime\">-</span></p>");
+        client.println("<p>Free heap: <span id=\"freeHeap\">-</span></p>");
+        client.println("<p>Firmware: 1.0.0</p>");
+        client.println("<p>ESP-NOW channel: <span id=\"channel\">-</span></p>");
+        client.println("</div></div>");
+
+        client.println("<div class=\"box\"><h2>Network</h2><div class=\"body\">");
+        client.println("<p>Connection status: <b id=\"connStatus\">-</b></p>");
+        client.println("<div id=\"netDetails\"></div>");
+        client.println("</div></div>");
+
+        client.println("<div class=\"box\"><h2>Hardware / Firmware</h2><div class=\"body\">");
+        client.printf("<p>Chip: %s rev %d, %d core(s)</p>\n", ESP.getChipModel(), ESP.getChipRevision(),
+                      ESP.getChipCores());
+        client.printf("<p>CPU frequency: %u MHz</p>\n", ESP.getCpuFreqMHz());
+        client.printf("<p>Flash size: %u bytes</p>\n", ESP.getFlashChipSize());
+        client.printf("<p>SDK version: %s</p>\n", ESP.getSdkVersion());
+        client.printf("<p>Last reset reason: %s</p>\n", reset_reason_str(esp_reset_reason()));
+        client.println("</div></div>");
+
+        client.println("<div class=\"box\"><h2>Actions</h2><div class=\"body\">");
+        client.println("<button class=\"reboot-btn\" onclick=\"rebootSelf(this)\">Reboot Gateway</button>"
+                       "<span id=\"rebootSelfStatus\" style=\"margin-left:10px;\"></span>");
+        client.println("</div></div>");
+        write_http_page_foot(client);
+    }
+
+    // Chunk size well under the W5500's per-socket TX buffer - see
+    // PoeStatusServer.cpp's own kLogoChunkSize comment for the exact bug
+    // (M5_Ethernet's socketSend() silently clamping a single large write)
+    // this sidesteps; WiFiClient has no equivalent limit but chunking it
+    // the same way regardless costs nothing and keeps one code path.
+    constexpr size_t kLogoChunkSize = 512;
+
+    template <typename ClientT>
+    void write_http_logo(ClientT &client)
+    {
+        client.println("HTTP/1.1 200 OK");
+        client.println("Content-Type: image/gif");
+        client.printf("Content-Length: %u\n", rts_gif_len);
+        client.println("Connection: close");
+        client.println();
+        size_t sent = 0;
+        while (sent < rts_gif_len)
+        {
+            size_t remaining = rts_gif_len - sent;
+            size_t chunk = remaining < kLogoChunkSize ? remaining : kLogoChunkSize;
+            size_t written = client.write(rts_gif + sent, chunk);
+            if (written == 0)
+                break;  // client disconnected mid-transfer
+            sent += written;
+        }
+    }
+
+    template <typename ClientT>
+    void write_http_status_json(ClientT &client)
+    {
+        uint32_t now = millis();
+        client.println("HTTP/1.1 200 OK");
+        client.println("Content-Type: application/json");
+        client.println("Connection: close");
+        client.println();
+        client.printf("{\"uptime\":%lu,\"freeHeap\":%u,\"channel\":%u,", static_cast<unsigned long>(now / 1000),
+                      ESP.getFreeHeap(), s_channel);
+
+        // Mutually exclusive by construction (see setup()'s own comment) -
+        // never both here either.
+        if (s_eth_connected)
+        {
+            client.print("\"connStatus\":\"Ethernet\",");
+            client.printf("\"ethIp\":\"%s\",", Ethernet.localIP().toString().c_str());
+        }
+        else if (s_wifi_connected)
+        {
+            client.print("\"connStatus\":\"WiFi (fallback)\",");
+            client.printf("\"wifiIp\":\"%s\",\"wifiSsid\":\"%s\",", WiFi.localIP().toString().c_str(),
+                          WiFi.SSID().c_str());
+        }
+        else
+        {
+            client.print("\"connStatus\":\"Disconnected\",");
+        }
+
+        client.print("\"devices\":[");
+        for (int i = 0; i < s_known_device_count; i++)
+        {
+            const KnownDevice &d = s_known_devices[i];
+            char macStr[18];
+            mac_to_str(d.mac, macStr, sizeof(macStr));
+            if (i > 0)
+                client.print(",");
+            client.print("{\"name\":\"");
+            client.print(d.friendlyName);
+            client.print("\",\"project\":\"");
+            client.print(d.projectName);
+            client.print("\",\"type\":\"");
+            client.print(d.deviceTypeName);
+            client.print("\",\"mac\":\"");
+            client.print(macStr);
+            client.print("\",\"ip\":");
+            if (d.ipv4Address != 0)
+            {
+                client.print("\"");
+                client.print(IPAddress(d.ipv4Address).toString());
+                client.print("\"");
+            }
+            else
+            {
+                client.print("null");
+            }
+            client.print(",\"meshRssi\":");
+            // espNowRssi: this gateway's own measured RSSI on this
+            // device's most recent ESP-NOW frame (see KnownDevice's own
+            // comment) - the same "MESH" signal the desktop app's Known
+            // Devices table shows, not wifiRssi (that device's own link
+            // to its WiFi router, a different physical link entirely).
+            if (d.espNowRssi == RTSNOW_RSSI_UNKNOWN)
+                client.print("null");
+            else
+                client.print(d.espNowRssi);
+            client.print(",\"ago\":");
+            client.print(static_cast<unsigned long>((now - d.lastSeenMs) / 1000));
+            client.print("}");
+        }
+        client.println("]}");
+    }
+
+    // Splits "GET /api/reboot?mac=AA:BB:CC:DD:EE:FF HTTP/1.1" into route
+    // ("/api/reboot") and query ("mac=AA:BB:CC:DD:EE:FF") separately - the
+    // route alone used to be extracted (as the whole path+query string,
+    // never actually containing a '?' before there was any endpoint that
+    // took query parameters at all).
+    void extract_http_request(const char *requestLine, char *outPath, size_t outPathSize, char *outQuery,
+                              size_t outQuerySize)
+    {
+        outPath[0] = '\0';
+        outQuery[0] = '\0';
+        const char *pathStart = strchr(requestLine, ' ');
+        if (pathStart == nullptr)
+            return;
+        pathStart++;
+        const char *pathEnd = strchr(pathStart, ' ');
+        if (pathEnd == nullptr)
+            return;
+        const char *queryStart = static_cast<const char *>(memchr(pathStart, '?', pathEnd - pathStart));
+        const char *routeEnd = queryStart != nullptr ? queryStart : pathEnd;
+        size_t routeLen = static_cast<size_t>(routeEnd - pathStart);
+        if (routeLen >= outPathSize)
+            routeLen = outPathSize - 1;
+        memcpy(outPath, pathStart, routeLen);
+        outPath[routeLen] = '\0';
+        if (queryStart != nullptr)
+        {
+            queryStart++;  // skip '?'
+            size_t queryLen = static_cast<size_t>(pathEnd - queryStart);
+            if (queryLen >= outQuerySize)
+                queryLen = outQuerySize - 1;
+            memcpy(outQuery, queryStart, queryLen);
+            outQuery[queryLen] = '\0';
+        }
+    }
+
+    // MAC addresses only ever contain hex digits and ':' - both URL-safe
+    // unencoded in a query component (see RFC 3986), so the JS side never
+    // percent-encodes it and this never needs to percent-decode either.
+    bool extract_query_param(const char *query, const char *key, char *outValue, size_t outSize)
+    {
+        size_t keyLen = strlen(key);
+        const char *p = query;
+        while (p != nullptr && *p != '\0')
+        {
+            if (strncmp(p, key, keyLen) == 0 && p[keyLen] == '=')
+            {
+                const char *valueStart = p + keyLen + 1;
+                const char *valueEnd = strchr(valueStart, '&');
+                size_t valueLen = valueEnd != nullptr ? static_cast<size_t>(valueEnd - valueStart)
+                                                      : strlen(valueStart);
+                if (valueLen >= outSize)
+                    valueLen = outSize - 1;
+                memcpy(outValue, valueStart, valueLen);
+                outValue[valueLen] = '\0';
+                return true;
+            }
+            p = strchr(p, '&');
+            if (p != nullptr)
+                p++;
+        }
+        return false;
+    }
+
+    // GET (not POST - this whole HTTP server only ever parses a request
+    // line, no body/headers - see poll_http_listener's own comment) -
+    // reboots exactly the one node named over ESP-NOW (do_reboot_send).
+    // Rebooting THIS gateway itself is a separate endpoint, see
+    // write_http_reboot_self_response below.
+    template <typename ClientT>
+    void write_http_reboot_response(ClientT &client, const char *query)
+    {
+        char macStr[24] = "";
+        uint8_t mac[6];
+        bool ok = false;
+        const char *error = "missing or invalid mac parameter";
+        if (extract_query_param(query, "mac", macStr, sizeof(macStr)) && parse_mac(macStr, mac))
+        {
+            error = do_reboot_send(mac);
+            ok = error == nullptr;
+        }
+        client.println("HTTP/1.1 200 OK");
+        client.println("Content-Type: application/json");
+        client.println("Connection: close");
+        client.println();
+        if (ok)
+            client.println("{\"ok\":true}");
+        else
+            client.printf("{\"ok\":false,\"error\":\"%s\"}\n", error);
+    }
+
+    // No mac/query involved at all - always targets this gateway itself,
+    // a purely local action (no ESP-NOW send). Writes the response, gives
+    // it a moment to actually reach the client (matches self_ota_end()'s
+    // own delay(100)-before-restart pattern elsewhere in this file), then
+    // restarts inline - same as every other reboot path in this codebase,
+    // not deferred through a pending-flag/loop() dance.
+    template <typename ClientT>
+    void write_http_reboot_self_response(ClientT &client)
+    {
+        client.println("HTTP/1.1 200 OK");
+        client.println("Content-Type: application/json");
+        client.println("Connection: close");
+        client.println();
+        client.println("{\"ok\":true}");
+        delay(150);
+        ESP.restart();
+    }
+
+    template <typename ServerT, typename ClientT>
+    void poll_http_listener(ServerT &server, HttpListenerState<ClientT> &st)
+    {
+        if (!st.client || !st.client.connected())
+        {
+            st.client = server.accept();
+            if (!st.client)
+                return;
+            st.reset();
+            st.clientStartMs = millis();
+        }
+
+        while (st.client.available())
+        {
+            char c = static_cast<char>(st.client.read());
+            if (c == '\n')
+            {
+                st.requestLineDone = true;
+                break;
+            }
+            if (c != '\r' && st.requestLineLen < sizeof(st.requestLine) - 1)
+                st.requestLine[st.requestLineLen++] = c;
+        }
+
+        if (st.requestLineDone)
+        {
+            st.requestLine[st.requestLineLen] = '\0';
+            char path[32];
+            char query[64];
+            extract_http_request(st.requestLine, path, sizeof(path), query, sizeof(query));
+            if (strcmp(path, "/api/status") == 0)
+                write_http_status_json(st.client);
+            else if (strcmp(path, "/api/reboot") == 0)
+                write_http_reboot_response(st.client, query);
+            else if (strcmp(path, "/api/reboot_self") == 0)
+                write_http_reboot_self_response(st.client);
+            else if (strcmp(path, "/logo.gif") == 0)
+                write_http_logo(st.client);
+            else if (strcmp(path, "/network") == 0)
+                write_http_network_page(st.client);
+            else if (strcmp(path, "/devices") == 0)
+                write_http_devices_page(st.client);
+            else if (strcmp(path, "/system") == 0)
+                write_http_system_page(st.client);
+            else
+                write_http_home_page(st.client);
+            st.client.stop();
+            st.reset();
+            return;
+        }
+
+        if (millis() - st.clientStartMs > kHttpClientTimeoutMs)
+        {
+            st.client.stop();
+            st.reset();
+        }
+    }
+
+    bool s_http_eth_started = false;
+    bool s_http_wifi_started = false;
+
+    // One-shot, boot-time decision, matching s_eth_connected/s_wifi_connected
+    // themselves (see setup()'s own comment) - not re-checked after boot.
+    void begin_http_status_server()
+    {
+        if (s_eth_connected)
+        {
+            s_http_eth_server.begin();
+            s_http_eth_started = true;
+            Serial.printf("HTTP status page (Ethernet) listening on http://%s/\n",
+                          Ethernet.localIP().toString().c_str());
+        }
+        else if (s_wifi_connected)
+        {
+            s_http_wifi_server.begin();
+            s_http_wifi_started = true;
+            Serial.printf("HTTP status page (WiFi) listening on http://%s/\n", WiFi.localIP().toString().c_str());
+        }
+    }
+
+    void poll_http_status_server()
+    {
+        if (s_http_eth_started)
+            poll_http_listener(s_http_eth_server, s_http_eth_state);
+        else if (s_http_wifi_started)
+            poll_http_listener(s_http_wifi_server, s_http_wifi_state);
+    }
+#endif
 
     // ---- Serial command handling: human-typeable text interface ----
 
@@ -1731,6 +2903,70 @@ namespace
         send_ack("espnow_ota_abort", &doc, error == nullptr, error);
     }
 
+    // ---- Firmware update over TCP - this gateway being flashed directly
+    // over the same JSON-lines connection a desktop app already has open
+    // (see self_ota_begin()'s own comment for how this shares state with
+    // the ESP-NOW receiving path above) ----
+
+    void handle_ota_start_command(const JsonDocument &doc)
+    {
+        uint32_t size = doc["size"] | 0;
+        uint32_t totalChunks = doc["totalChunks"] | 0;
+        const char *md5 = doc["md5"] | "";
+        if (strlen(md5) != 32)
+        {
+            send_ack("ota_start", &doc, false, "md5 must be exactly 32 hex chars");
+            return;
+        }
+        char error[32] = "";
+        bool began = self_ota_begin(size, totalChunks, md5, error, sizeof(error));
+        send_ack("ota_start", &doc, began, began ? nullptr : error);
+    }
+
+    void handle_ota_chunk_command(const JsonDocument &doc)
+    {
+        uint32_t index = doc["index"] | 0;
+        const char *hex = doc["dataHex"] | "";
+        // Independent of RTSNOW_OtaChunk.data[220] (the ESP-NOW path's own
+        // buffer, capped by ESP-NOW's ~250-byte payload limit) - this is a
+        // separate command family carried over a real TCP socket, with no
+        // radio-payload constraint at all. Matches kTcpChunkSize in
+        // gateway_tcp_ota_cli.py - keep both in sync if this changes
+        // (also bump TcpClientState::lineBuf's size to fit the resulting
+        // hex-encoded line).
+        uint8_t buf[2048];
+        size_t len = 0;
+        if (!hex_decode(hex, buf, sizeof(buf), len))
+        {
+            send_ack("ota_chunk", &doc, false, "invalid or oversized dataHex");
+            return;
+        }
+        // Own event type (not send_ack's plain ok/error shape) so the
+        // client can correlate the ack to a specific chunk index, exactly
+        // like espnow_ota_chunk_ack does for the mesh path.
+        JsonDocument out;
+        out["event"] = "ota_chunk_ack";
+        out["index"] = index;
+        out["ok"] = self_ota_write_chunk(index, buf, static_cast<uint16_t>(len));
+        echo_id(out, doc);
+        emit_json(out);
+    }
+
+    void handle_ota_end_command(const JsonDocument &doc)
+    {
+        char error[32] = "";
+        bool success = self_ota_end(error, sizeof(error));
+        // self_ota_end() already restarted the chip on success - this ack
+        // only actually reaches the client on the failure path.
+        send_ack("ota_end", &doc, success, success ? nullptr : error);
+    }
+
+    void handle_ota_abort_command(const JsonDocument &doc)
+    {
+        self_ota_abort();
+        send_ack("ota_abort", &doc, true);
+    }
+
     void handle_channel_command(const JsonDocument &doc)
     {
         int value = doc["value"] | -1;
@@ -1826,6 +3062,14 @@ namespace
             handle_espnow_ota_end_command(doc);
         else if (strcmp(cmd, "espnow_ota_abort") == 0)
             handle_espnow_ota_abort_command(doc);
+        else if (strcmp(cmd, "ota_start") == 0)
+            handle_ota_start_command(doc);
+        else if (strcmp(cmd, "ota_chunk") == 0)
+            handle_ota_chunk_command(doc);
+        else if (strcmp(cmd, "ota_end") == 0)
+            handle_ota_end_command(doc);
+        else if (strcmp(cmd, "ota_abort") == 0)
+            handle_ota_abort_command(doc);
         else if (strcmp(cmd, "channel") == 0)
             handle_channel_command(doc);
         else if (strcmp(cmd, "force_route") == 0)
@@ -2044,6 +3288,47 @@ namespace
             emit_json(doc);
             break;
         }
+        // Firmware update over ESP-NOW, RECEIVING side - this gateway
+        // itself being flashed (see service_self_ota()'s own comment).
+        // Every message here just flags + copies the small fixed-size
+        // payload; service_self_ota() (called from loop()) does the
+        // actual Update.begin()/write()/end() calls, keeping flash access
+        // out of this callback's task context - same deferred pattern
+        // rtsnow_node.cpp uses for a node's own receiving side.
+        case RTSNOW_OTA_START:
+            if (payloadLen >= static_cast<int>(sizeof(RTSNOW_OtaStart)))
+            {
+                memcpy(&s_pendingSelfOtaStart, payload, sizeof(s_pendingSelfOtaStart));
+                memcpy(s_pendingSelfOtaStartMac, mac, 6);
+                s_pendingSelfOtaStartRequesterId = header.sourceID;
+                s_selfOtaStartPending = true;
+            }
+            break;
+        case RTSNOW_OTA_CHUNK:
+            if (payloadLen >= static_cast<int>(sizeof(RTSNOW_OtaChunk)))
+            {
+                // Drop (don't buffer) if a previous chunk hasn't been
+                // processed yet - the sender's own strict stop-and-wait
+                // means this should never happen; dropping is correct for
+                // a stray duplicate/retransmit that arrives after this
+                // gateway already moved on.
+                if (!s_selfOtaChunkPending)
+                {
+                    memcpy(&s_pendingSelfOtaChunk, payload, sizeof(s_pendingSelfOtaChunk));
+                    memcpy(s_pendingSelfOtaChunkMac, mac, 6);
+                    s_pendingSelfOtaChunkRequesterId = header.sourceID;
+                    s_selfOtaChunkPending = true;
+                }
+            }
+            break;
+        case RTSNOW_OTA_END:
+            memcpy(s_pendingSelfOtaEndMac, mac, 6);
+            s_pendingSelfOtaEndRequesterId = header.sourceID;
+            s_selfOtaEndPending = true;
+            break;
+        case RTSNOW_OTA_ABORT:
+            s_selfOtaAbortPending = true;
+            break;
         default:
             break; // not yet handled by this gateway
         }
@@ -2119,6 +3404,20 @@ namespace
 
     void update_led()
     {
+        // Takes priority over everything else below - a self-OTA transfer
+        // in progress (this gateway itself being flashed, whether the
+        // request arrived over TCP or ESP-NOW - both funnel through the
+        // same s_selfOtaActive/self_ota_begin(), see that function's own
+        // comment) is the one state worth a human physically walking up
+        // to check on, so it should be visually unmistakable regardless
+        // of whatever else this gateway happens to be doing at that
+        // moment (mesh traffic, a pending provisioning request, etc.).
+        if (s_selfOtaActive)
+        {
+            bool blinkOn = (millis() / 150) % 2 == 0;
+            set_led(blinkOn ? s_led.Color(255, 255, 255) : 0);
+            return;
+        }
         if (millis() < s_rx_flash_until_ms)
         {
             set_led(s_led.Color(0, 200, 0));
@@ -2167,6 +3466,54 @@ void setup()
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
     apply_channel(s_channel);
+
+#if defined(BOARD_GATEWAY_ATOMS3_POE)
+    // Ethernet-priority, WiFi fallback - never both at once. Ethernet
+    // tried first since it's this board's normal, wired, PoE-powered
+    // state; WiFi only attempted if that fails, so USB-free network
+    // reachability survives an unplugged/dead Ethernet cable instead of
+    // this unit going completely silent apart from USB serial.
+    //
+    // The channel-lock concern this section used to (Ethernet-only, no
+    // fallback at all) avoid entirely is real, not cosmetic: the whole
+    // mesh depends on every node finding this gateway on one known ESP-NOW
+    // channel. A real WiFi.begin(ssid, pass) association silently re-locks
+    // the radio's channel to whatever the AP uses, regardless of what
+    // apply_channel(s_channel) set moments ago - fighting that (forcing
+    // s_channel back) would just break the WiFi association itself (the
+    // AP won't hear a STA that's been yanked off its channel). So instead
+    // of fighting it, this embraces it: on a successful WiFi fallback,
+    // s_channel is updated (not persisted - Ethernet may well be back next
+    // boot, and the manually configured default channel should still
+    // apply then) to match wherever WiFi actually landed, exactly like an
+    // ordinary WiFi-connected node already does (see EspNowLink.cpp).
+    s_eth_connected = gateway_ethernet_begin();
+    if (!s_eth_connected)
+    {
+        Serial.println("Ethernet down - trying WiFi fallback...");
+        WiFi.begin(GATEWAY_WIFI_SSID, GATEWAY_WIFI_PASSWORD);
+        uint32_t wifiFallbackStart = millis();
+        while (WiFi.status() != WL_CONNECTED && millis() - wifiFallbackStart < 15000)
+            delay(100);
+        s_wifi_connected = WiFi.status() == WL_CONNECTED;
+        if (s_wifi_connected)
+        {
+            apply_channel(WiFi.channel());
+            Serial.printf("WiFi fallback OK: SSID=%s IP=%s channel=%u\n", WiFi.SSID().c_str(),
+                          WiFi.localIP().toString().c_str(), s_channel);
+        }
+        else
+        {
+            Serial.println("WiFi fallback FAILED - neither transport is up; staying on the configured "
+                            "channel, USB serial still works regardless.");
+        }
+    }
+    else
+    {
+        Serial.println("Ethernet OK - skipping WiFi fallback (never both at once, see this section's own comment).");
+    }
+    begin_http_status_server();
+#endif
 
     if (esp_now_init() != ESP_OK)
     {
@@ -2218,10 +3565,17 @@ void setup()
 void loop()
 {
     service_serial();
+#if defined(BOARD_GATEWAY_ATOMS3_POE)
+    if (s_eth_connected)
+        Ethernet.maintain();  // renews the DHCP lease as needed; no-op otherwise
+    poll_tcp_server();
+    poll_http_status_server();
+#endif
     expire_pending();
     expire_awaiting_confirm();
     recompute_routing_if_due();
     send_gateway_announce_if_due();
+    service_self_ota();
     drain_output_queue();
     update_led();
     delay(20);

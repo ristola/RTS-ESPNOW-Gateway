@@ -1,6 +1,35 @@
 from dataclasses import dataclass, field
 from typing import Optional
 
+# deviceTypeName travels the wire as a fixed, terse identifier
+# (RTSNOW_DeviceIdentity.deviceTypeName is a hyphen-free char[16], can't
+# fit e.g. "Ethernet-Gateway" with a null terminator) - this maps those
+# wire values to a friendlier label for display only, never touching the
+# wire format itself. Anything not listed here (PolymerPak's SolarTracker,
+# etc.) is returned verbatim, unmapped.
+_DEVICE_TYPE_LABELS = {
+    "UsbGateway": "USB-Gateway",
+    "EthernetGateway": "Ethernet-Gateway",
+    # RTSNow-SPI-CCP's own dryer/crystallizer node firmware - "RTSNow-UNADYN"
+    # is main_atom_node.cpp's wire deviceTypeName, kept as-is there; this is
+    # a display-only rename to the project's actual name.
+    "RTSNow-UNADYN": "SPI-CCP",
+}
+
+
+def device_type_label(device_type_name: str) -> str:
+    return _DEVICE_TYPE_LABELS.get(device_type_name, device_type_name)
+
+
+# Any RTS-NOW device whose deviceTypeName is one of these is a gateway
+# itself (USB dongle or PoE/Ethernet), not a node with real RS-485/dryer
+# equipment attached. Its own explicit set, NOT derived from
+# _DEVICE_TYPE_LABELS' keys (that dict now also carries non-gateway
+# rename-only entries like "RTSNow-UNADYN" - deriving from it here would
+# wrongly mark real dryer nodes as gateways too and hide their equipment
+# config box).
+GATEWAY_DEVICE_TYPES = frozenset({"UsbGateway", "EthernetGateway"})
+
 
 @dataclass
 class NeighborLink:
