@@ -38,15 +38,28 @@ class GatewayTcp:
         self.sock.settimeout(0.05)
         self._buf = b""
         self._id_counter = 0
+        # Set once the socket is confirmably dead (a reset, not just a
+        # read timing out) - see poll_lines()'s own comment. Once true,
+        # neither send() nor poll_lines() will do anything further; the
+        # caller (send_and_wait) checks this to stop retrying immediately
+        # instead of raising on the next attempt to use a dead socket.
+        self.closed = False
 
     def send(self, cmd: dict) -> int:
         self._id_counter += 1
         cmd = dict(cmd)
         cmd["id"] = self._id_counter
-        self.sock.sendall((json.dumps(cmd) + "\n").encode("utf-8"))
+        if self.closed:
+            return cmd["id"]
+        try:
+            self.sock.sendall((json.dumps(cmd) + "\n").encode("utf-8"))
+        except OSError:
+            self.closed = True
         return cmd["id"]
 
     def poll_lines(self) -> list[dict]:
+        if self.closed:
+            return []
         try:
             # Comfortably larger than one hex-encoded 2048-byte chunk line
             # (~4160 bytes with JSON overhead) - not required for
@@ -58,6 +71,15 @@ class GatewayTcp:
                 self._buf += chunk
         except (socket.timeout, BlockingIOError):
             pass
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+            # The gateway tore down the TCP connection abruptly - expected
+            # when it was mid-reboot (an OTA success case, see
+            # push_firmware()'s own handling of this exact situation),
+            # ambiguous otherwise. Either way the socket is dead: mark it
+            # so the caller stops retrying instead of raising again on the
+            # next send().
+            self.closed = True
+            return []
         out = []
         while b"\n" in self._buf:
             raw, self._buf = self._buf.split(b"\n", 1)
@@ -82,6 +104,13 @@ def send_and_wait(gw: GatewayTcp, cmd: dict, matches, description: str, log):
             result = matches(obj)
             if result is not None:
                 return result
+        if gw.closed:
+            # The connection was reset, not just quiet - retrying would
+            # just call send() on a dead socket for no benefit. Same "no
+            # response" return as a plain retry-exhausted timeout; the
+            # caller (push_firmware) already treats that as ambiguous-
+            # but-likely-success on the ota_end step specifically.
+            return None
         if time.time() >= next_retry:
             attempts += 1
             if attempts > MAX_RETRIES:

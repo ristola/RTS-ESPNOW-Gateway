@@ -33,6 +33,7 @@
 #include <SPI.h>
 #include <utility/w5100.h>  // for W5100.init() directly - see gateway_ethernet_begin()'s own comment
 #include "secrets.h"         // GATEWAY_WIFI_SSID/PASSWORD - WiFi fallback only, gitignored
+#include <ESPmDNS.h>          // WiFi-fallback mDNS only - see kMdnsHostname's own comment for the Ethernet story
 #include "rtslogo.h"          // RTS logo, served at /logo.gif by the HTTP status page below
 #endif
 
@@ -1549,14 +1550,191 @@ namespace
         return true;
     }
 
-    // Real constraint, found while verifying against the vendored library:
-    // M5_Ethernet's own M5_Ethernet.h hardcodes MAX_SOCK_NUM to 2 (not
-    // #ifndef-guarded, so a build-flag override doesn't work). With only 2
-    // hardware sockets total - shared by this listener, any established
-    // client, and Ethernet.maintain()'s own transient DHCP-renewal socket -
-    // this library build reliably sustains one actively-connected TCP
-    // client, not true concurrency - genuinely capped, not just an
-    // arbitrary choice, unlike the WiFi constant below.
+    // ---- mDNS - "RTSNow.local" resolves to whichever IP is currently
+    // active, over either transport ----
+    //
+    // WiFi fallback uses the standard ESPmDNS library (ESP-IDF's mdns
+    // component, bound to the ESP32's own native WiFi interface) - see
+    // setup()'s own MDNS.begin() call. That library can NOT be used for
+    // Ethernet: the W5500 runs its own hardware TCP/IP stack, entirely
+    // invisible to ESP-IDF's own network stack (the same reason
+    // ArduinoOTA/WiFiUDP can't see it either, per this file's own
+    // comments elsewhere) - there is no esp_netif handle to bind mdns to.
+    //
+    // So this hand-rolls just enough of RFC 6762 to answer one specific
+    // question over Ethernet: an A-record query for kMdnsHostname+".local"
+    // gets this gateway's Ethernet IP back, multicast to 224.0.0.251:5353
+    // (the same group every mDNS listener - avahi, macOS's mDNSResponder,
+    // `dns-sd`, `ping foo.local` - already joined to send the query in
+    // the first place). Nothing else in the spec (PTR/SRV/TXT records,
+    // service discovery, conflict resolution, compressed names anywhere
+    // but our own reply) is implemented - this exists purely so
+    // `ping/ssh rtsnow.local` resolves from a command line without
+    // needing to know the current DHCP-assigned IP.
+    constexpr uint16_t kMdnsPort = 5353;
+    const IPAddress kMdnsMulticastAddr(224, 0, 0, 251);
+    constexpr const char *kMdnsHostname = "RTSNow";  // -> "rtsnow.local" (mDNS names are case-insensitive)
+    EthernetUDP s_mdns_eth_udp;
+    bool s_mdns_eth_started = false;
+
+    // Decodes one DNS name starting at buf[offset] into outName (plain,
+    // lowercased, dot-joined, e.g. "rtsnow.local"). Refuses (returns
+    // false) on a compression pointer (a length byte >= 0xC0) - a real
+    // query's own question name never uses one (there's nothing earlier
+    // in the packet to point at), so anything that looks like one here
+    // is either malformed or not a plain question we need to answer.
+    // Also bails out on any length that would read past bufLen
+    // (truncated/malformed packet) rather than trusting untrusted network
+    // input. outConsumedLen is the number of bytes read on success,
+    // including the terminating 0x00, so the caller can correctly skip
+    // past QTYPE/QCLASS next.
+    bool mdns_decode_name(const uint8_t *buf, size_t bufLen, size_t offset, char *outName, size_t outNameMax,
+                          size_t &outConsumedLen)
+    {
+        size_t pos = offset;
+        size_t nameLen = 0;
+        outName[0] = '\0';
+        while (true)
+        {
+            if (pos >= bufLen)
+                return false;
+            uint8_t len = buf[pos];
+            if (len == 0)
+            {
+                pos++;
+                break;
+            }
+            if (len >= 0xC0)
+                return false;
+            pos++;
+            if (pos + len > bufLen)
+                return false;
+            if (nameLen > 0)
+            {
+                if (nameLen + 1 >= outNameMax)
+                    return false;
+                outName[nameLen++] = '.';
+            }
+            for (uint8_t i = 0; i < len; i++)
+            {
+                if (nameLen + 1 >= outNameMax)
+                    return false;
+                outName[nameLen++] = static_cast<char>(tolower(buf[pos + i]));
+            }
+            outName[nameLen] = '\0';
+            pos += len;
+        }
+        outConsumedLen = pos - offset;
+        return true;
+    }
+
+    void begin_mdns_ethernet()
+    {
+        if (s_mdns_eth_udp.beginMulticast(kMdnsMulticastAddr, kMdnsPort))
+        {
+            s_mdns_eth_started = true;
+            Serial.printf("mDNS (Ethernet): responding to %s.local queries\n", kMdnsHostname);
+        }
+        else
+        {
+            Serial.println("mDNS (Ethernet): beginMulticast failed - no free socket?");
+        }
+    }
+
+    void poll_mdns_ethernet()
+    {
+        if (!s_mdns_eth_started)
+            return;
+        int packetSize = s_mdns_eth_udp.parsePacket();
+        if (packetSize <= 0)
+            return;
+        static uint8_t buf[512];
+        if (static_cast<size_t>(packetSize) > sizeof(buf))
+        {
+            s_mdns_eth_udp.flush();
+            return;
+        }
+        int readLen = s_mdns_eth_udp.read(buf, sizeof(buf));
+        if (readLen < 12)
+            return;  // shorter than a DNS header - malformed
+
+        uint16_t flags = (static_cast<uint16_t>(buf[2]) << 8) | buf[3];
+        uint16_t qdcount = (static_cast<uint16_t>(buf[4]) << 8) | buf[5];
+        if ((flags & 0x8000) != 0)
+            return;  // QR=1 - a response from someone else on this multicast group, not a query
+        if (qdcount == 0)
+            return;
+
+        size_t nameStart = 12;
+        char name[64];
+        size_t consumed = 0;
+        if (!mdns_decode_name(buf, static_cast<size_t>(readLen), nameStart, name, sizeof(name), consumed))
+            return;
+        size_t offset = nameStart + consumed;
+        if (offset + 4 > static_cast<size_t>(readLen))
+            return;
+        uint16_t qtype = (static_cast<uint16_t>(buf[offset]) << 8) | buf[offset + 1];
+        // QCLASS at buf[offset+2..3] (top bit is mDNS's "unicast response
+        // requested" flag) - ignored, this always replies multicast
+        // regardless, which every mDNS listener already accepts.
+
+        char expectedName[32];
+        snprintf(expectedName, sizeof(expectedName), "%s.local", kMdnsHostname);
+        for (char *p = expectedName; *p != '\0'; p++)
+            *p = static_cast<char>(tolower(*p));
+        if (strcmp(name, expectedName) != 0)
+            return;
+        if (qtype != 1 && qtype != 255)  // A, or ANY
+            return;
+
+        uint8_t resp[128];
+        size_t rlen = 0;
+        resp[rlen++] = 0x00;
+        resp[rlen++] = 0x00;  // ID = 0 (conventional for unsolicited/multicast mDNS responses)
+        resp[rlen++] = 0x84;
+        resp[rlen++] = 0x00;  // flags: QR=1 (response), AA=1 (authoritative)
+        resp[rlen++] = 0x00;
+        resp[rlen++] = 0x00;  // QDCOUNT = 0
+        resp[rlen++] = 0x00;
+        resp[rlen++] = 0x01;  // ANCOUNT = 1
+        resp[rlen++] = 0x00;
+        resp[rlen++] = 0x00;  // NSCOUNT = 0
+        resp[rlen++] = 0x00;
+        resp[rlen++] = 0x00;  // ARCOUNT = 0
+        memcpy(resp + rlen, buf + nameStart, consumed);  // reuse the query's own encoded name verbatim
+        rlen += consumed;
+        resp[rlen++] = 0x00;
+        resp[rlen++] = 0x01;  // TYPE = A
+        resp[rlen++] = 0x80;
+        resp[rlen++] = 0x01;  // CLASS = IN (0x0001) with the mDNS cache-flush bit (0x8000) set
+        resp[rlen++] = 0x00;
+        resp[rlen++] = 0x00;
+        resp[rlen++] = 0x00;
+        resp[rlen++] = 0x78;  // TTL = 120s
+        resp[rlen++] = 0x00;
+        resp[rlen++] = 0x04;  // RDLENGTH = 4
+        IPAddress ip = Ethernet.localIP();
+        resp[rlen++] = ip[0];
+        resp[rlen++] = ip[1];
+        resp[rlen++] = ip[2];
+        resp[rlen++] = ip[3];
+
+        s_mdns_eth_udp.beginPacket(kMdnsMulticastAddr, kMdnsPort);
+        s_mdns_eth_udp.write(resp, rlen);
+        s_mdns_eth_udp.endPacket();
+    }
+
+    // M5_Ethernet's own M5_Ethernet.h now patches MAX_SOCK_NUM up to the
+    // W5500's real max of 8 (see that file's own comment - upstream
+    // hardcoded it to 2, which starved this gateway's two listening
+    // servers against each other once the HTTP status site was added
+    // alongside the JSON protocol server). Budget across all 8: JSON
+    // listener(1) + these clients(1) + HTTP listener(1) + HTTP clients
+    // (kMaxEthHttpClients, 3 - see that constant's own comment for why
+    // it needs real headroom, unlike this one) + the Ethernet mDNS
+    // responder's own UDP socket(1) + a spare for Ethernet.maintain()'s
+    // transient DHCP-renewal socket(1) = 8 of 8, fully budgeted rather
+    // than reserving slack neither transport actually needs.
     constexpr uint8_t kMaxEthTcpClients = 1;
     // WiFi (ESP32's native lwIP) has no equivalent hardware ceiling - this
     // used to share the Ethernet constant above (=1) for no real reason,
@@ -1678,23 +1856,25 @@ namespace
             serverStarted = true;
             Serial.printf("TCP JSON server (%s) listening on port %u\n", transportLabel, kGatewayTcpPort);
         }
-        bool slotClaimed = false;
+        // Keeps accepting into every free slot, not just the first one -
+        // see poll_http_listener()'s own comment for why a single
+        // accept() per call silently lost every simultaneous connection
+        // past the first, even with several slots configured.
+        bool anyFree = false;
         for (uint8_t i = 0; i < clientCount; i++)
         {
             if (!clients[i].client || !clients[i].client.connected())
             {
+                anyFree = true;
                 ClientT incoming = server.accept();
-                if (incoming)
-                {
-                    clients[i].client = incoming;
-                    clients[i].reset();
-                    Serial.printf("TCP client connected (%s).\n", transportLabel);
-                }
-                slotClaimed = true;
-                break;
+                if (!incoming)
+                    break;
+                clients[i].client = incoming;
+                clients[i].reset();
+                Serial.printf("TCP client connected (%s).\n", transportLabel);
             }
         }
-        if (!slotClaimed)
+        if (!anyFree)
         {
             ClientT incoming = server.accept();
             if (incoming)
@@ -1815,6 +1995,20 @@ namespace
     // cosmetic-only page) - plain text/table content only.
     constexpr uint16_t kHttpPort = 80;
     constexpr uint32_t kHttpClientTimeoutMs = 3000;
+    // A real browser opens several simultaneous connections for one page
+    // load - the document itself, the logo image, and the page's own
+    // script firing its first fetch('/api/status') immediately - not one
+    // at a time. This used to be a single non-array slot per transport
+    // (mirroring an early mistake already fixed once for the JSON
+    // protocol server - see kMaxEthTcpClients/kMaxWifiTcpClients's own
+    // comments), so only the FIRST of those concurrent requests ever got
+    // served; the rest got an outright connection refusal, silently
+    // swallowed by the page's own fetch().catch(){} - symptom looked
+    // exactly like "the page only updates on the 5s timer, not
+    // immediately on load", confirmed live via a concurrent-request test
+    // (3 of 4 simultaneous requests refused outright with just 1 slot).
+    constexpr uint8_t kMaxEthHttpClients = 3;
+    constexpr uint8_t kMaxWifiHttpClients = 4;  // no hardware ceiling on WiFi - see kMaxWifiTcpClients's own comment
 
     template <typename ClientT>
     struct HttpListenerState
@@ -1833,8 +2027,37 @@ namespace
 
     EthernetServer s_http_eth_server(kHttpPort);
     WiFiServer s_http_wifi_server(kHttpPort);
-    HttpListenerState<EthernetClient> s_http_eth_state;
-    HttpListenerState<WiFiClient> s_http_wifi_state;
+    HttpListenerState<EthernetClient> s_http_eth_states[kMaxEthHttpClients];
+    HttpListenerState<WiFiClient> s_http_wifi_states[kMaxWifiHttpClients];
+
+    // M5_Ethernet's socketSend() silently clamps any single write over
+    // ~2KB (the W5500's per-socket TX buffer) while still reporting the
+    // full size as sent - see write_http_logo()'s own comment, which
+    // already worked around this for the logo specifically. write_http_
+    // style()/write_http_script() below are each one big println() call
+    // built from many adjacent string literals - write_http_script() grew
+    // past 2KB over the course of this session without this same
+    // discipline applied, and got silently truncated on Ethernet as a
+    // result (confirmed live: the page loaded, but every AJAX-updated
+    // field stayed at its placeholder "-" because the truncated <script>
+    // block failed to parse in the browser at all). Chunking both here,
+    // not just whichever one happens to be over the line today.
+    constexpr size_t kHttpWriteChunkSize = 512;
+
+    template <typename ClientT>
+    void write_http_chunked(ClientT &client, const char *data)
+    {
+        size_t total = strlen(data);
+        size_t sent = 0;
+        while (sent < total)
+        {
+            size_t chunk = (total - sent) < kHttpWriteChunkSize ? (total - sent) : kHttpWriteChunkSize;
+            size_t written = client.write(reinterpret_cast<const uint8_t *>(data) + sent, chunk);
+            if (written == 0)
+                return;  // client gone
+            sent += written;
+        }
+    }
 
     template <typename ClientT>
     void write_http_style(ClientT &client)
@@ -1844,7 +2067,7 @@ namespace
         // physical board family and the same "Digi gateway admin UI" look
         // that page deliberately borrowed, so this page matches it exactly
         // rather than introducing a second, different visual language.
-        client.println("<style>"
+        write_http_chunked(client, "<style>"
                        "body{font-family:-apple-system,Arial,sans-serif;margin:0;background:#fff;color:#222;}"
                        "#topbar{display:flex;align-items:center;gap:16px;padding:12px 20px;}"
                        "#topbar img{width:100px;height:100px;}"
@@ -1884,7 +2107,7 @@ namespace
     template <typename ClientT>
     void write_http_script(ClientT &client)
     {
-        client.println("<script>"
+        write_http_chunked(client, "<script>"
                        // Mirrors desktop-app/src/gateway/models.py's own
                        // _DEVICE_TYPE_LABELS exactly - deviceTypeName
                        // travels the wire as a terse, hyphen-free
@@ -2338,18 +2561,16 @@ namespace
         ESP.restart();
     }
 
-    template <typename ServerT, typename ClientT>
-    void poll_http_listener(ServerT &server, HttpListenerState<ClientT> &st)
+    // One slot's worth of request handling - accepting into a free/
+    // evicted slot and iterating every connected slot both happen in
+    // poll_http_listener() below, mirroring poll_tcp_clients()'s own
+    // multi-slot pattern (same reasoning: a single-client design silently
+    // refuses every additional simultaneous connection instead of queuing
+    // it, and a real browser opens several at once per page load - see
+    // kMaxEthHttpClients's own comment for how this was actually found).
+    template <typename ClientT>
+    void service_http_client(HttpListenerState<ClientT> &st)
     {
-        if (!st.client || !st.client.connected())
-        {
-            st.client = server.accept();
-            if (!st.client)
-                return;
-            st.reset();
-            st.clientStartMs = millis();
-        }
-
         while (st.client.available())
         {
             char c = static_cast<char>(st.client.read());
@@ -2396,6 +2617,54 @@ namespace
         }
     }
 
+    template <typename ServerT, typename ClientT>
+    void poll_http_listener(ServerT &server, HttpListenerState<ClientT> *states, uint8_t clientCount)
+    {
+        // Keeps accepting into every free slot, not just the first one -
+        // a single accept() per call meant several truly-simultaneous
+        // incoming connections (confirmed live: a browser's document +
+        // logo + immediate AJAX fetch, all landing in the same instant)
+        // only ever got ONE of them serviced per tick even with multiple
+        // slots configured, since the loop used to stop right after the
+        // first free slot regardless of whether more were both free and
+        // pending. Only stops early once accept() itself has nothing left
+        // to give - trying further free slots after that wouldn't help.
+        bool anyFree = false;
+        for (uint8_t i = 0; i < clientCount; i++)
+        {
+            if (!states[i].client || !states[i].client.connected())
+            {
+                anyFree = true;
+                ClientT incoming = server.accept();
+                if (!incoming)
+                    break;
+                states[i].client = incoming;
+                states[i].reset();
+                states[i].clientStartMs = millis();
+            }
+        }
+        if (!anyFree)
+        {
+            // Every slot full - evict the oldest (slot 0, same reasoning
+            // as poll_tcp_clients()'s own comment: a small, short-lived
+            // array isn't worth real LRU bookkeeping) rather than refuse
+            // the new connection outright - the exact behavior that
+            // caused this whole class of bug in the first place.
+            ClientT incoming = server.accept();
+            if (incoming)
+            {
+                states[0].client.stop();
+                states[0].client = incoming;
+                states[0].reset();
+                states[0].clientStartMs = millis();
+            }
+        }
+
+        for (uint8_t i = 0; i < clientCount; i++)
+            if (states[i].client && states[i].client.connected())
+                service_http_client(states[i]);
+    }
+
     bool s_http_eth_started = false;
     bool s_http_wifi_started = false;
 
@@ -2421,9 +2690,9 @@ namespace
     void poll_http_status_server()
     {
         if (s_http_eth_started)
-            poll_http_listener(s_http_eth_server, s_http_eth_state);
+            poll_http_listener(s_http_eth_server, s_http_eth_states, kMaxEthHttpClients);
         else if (s_http_wifi_started)
-            poll_http_listener(s_http_wifi_server, s_http_wifi_state);
+            poll_http_listener(s_http_wifi_server, s_http_wifi_states, kMaxWifiHttpClients);
     }
 #endif
 
@@ -3513,6 +3782,15 @@ void setup()
         Serial.println("Ethernet OK - skipping WiFi fallback (never both at once, see this section's own comment).");
     }
     begin_http_status_server();
+    if (s_eth_connected)
+        begin_mdns_ethernet();
+    else if (s_wifi_connected)
+    {
+        if (MDNS.begin(kMdnsHostname))
+            Serial.printf("mDNS (WiFi): responding to %s.local queries\n", kMdnsHostname);
+        else
+            Serial.println("mDNS (WiFi): MDNS.begin() failed");
+    }
 #endif
 
     if (esp_now_init() != ESP_OK)
@@ -3570,6 +3848,10 @@ void loop()
         Ethernet.maintain();  // renews the DHCP lease as needed; no-op otherwise
     poll_tcp_server();
     poll_http_status_server();
+    if (s_eth_connected)
+        poll_mdns_ethernet();
+    // WiFi's own mDNS (ESPmDNS/esp-idf mdns component) runs its own
+    // background task once MDNS.begin() succeeds - no poll needed here.
 #endif
     expire_pending();
     expire_awaiting_confirm();

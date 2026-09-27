@@ -30,6 +30,41 @@ def device_type_label(device_type_name: str) -> str:
 # config box).
 GATEWAY_DEVICE_TYPES = frozenset({"UsbGateway", "EthernetGateway"})
 
+# Mirrors RTSNow-SPI-CCP's ModbusReg::kModelType register (40004, see
+# include/ModbusRegisterMap.h's own comment there) and DeviceSettings.h's
+# EquipmentType/kCrystallizerModels/kEthernetModels - no shared source
+# between that C++ firmware and this Python file, keep both in sync by
+# hand if the model list ever changes. Lets equipmentType/model be derived
+# from register_values alone (already relayed over ESP-NOW regardless of
+# a node's direct WiFi/IP reachability) as a fallback for weak-link nodes
+# like Dryer SHED, where DeviceInfoFetcher's direct http://<ip>/api/data
+# fetch can never succeed because the node has no IP at all.
+MODBUS_REG_MODEL_TYPE = 40004
+_MODEL_TYPE_CODES = {
+    0: ("Dryer", "FC"),
+    1: ("Dryer", "FD"),
+    2: ("Dryer", "FN"),
+    3: ("Dryer", "ADV"),
+    4: ("Dryer", "CD"),
+    5: ("Crystallizer", "FC-XTLR"),
+    6: ("Crystallizer", "FN-XTLR"),
+    # 7 = "ETHERNET" - not a Dryer/Crystallizer at all (an Ethernet-gateway
+    # node with no RS-485 equipment attached) - deliberately excluded so
+    # it's treated the same as an unrecognized code: no equipmentType/model
+    # info to report, falls back to the generic Node Detail page.
+}
+
+
+def decode_model_type_register(value: int) -> Optional[dict]:
+    """{"equipmentType": ..., "model": ...} for a kModelType register
+    value, matching what DeviceInfoFetcher's own /api/data response shape
+    provides - or None for an unrecognized code (including 7/ETHERNET)."""
+    entry = _MODEL_TYPE_CODES.get(value)
+    if entry is None:
+        return None
+    equipment_type, model = entry
+    return {"equipmentType": equipment_type, "model": model}
+
 
 @dataclass
 class NeighborLink:

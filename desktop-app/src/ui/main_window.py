@@ -1,3 +1,4 @@
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -23,7 +24,7 @@ from PySide6.QtWidgets import (
 
 from src.gateway.device_info_client import DeviceInfoFetcher
 from src.gateway.espnow_ota_transfer import EspNowOtaTransfer
-from src.gateway.models import KnownDevice
+from src.gateway.models import MODBUS_REG_MODEL_TYPE, KnownDevice, decode_model_type_register
 from src.gateway.network_client import NetworkGatewayClient
 from src.gateway.node_flasher import ChipMacReader, NodeFlasherClient, PioBuildClient
 from src.gateway.ota_client import OtaPushClient
@@ -96,6 +97,16 @@ class MainWindow(QMainWindow):
         # no notion of equipmentType/model at all (see PROTOCOL.md).
         self._device_info: dict[str, dict] = {}
         self._info_fetchers: dict[str, DeviceInfoFetcher] = {}  # mac -> in-flight fetch
+        # Fallback for a device with no IP at all (e.g. Dryer SHED's
+        # persistently weak link) where DeviceInfoFetcher's direct HTTP
+        # fetch can never succeed - asks over the ESP-NOW mesh instead
+        # (poll_registers, already relay-capable) and derives equipmentType/
+        # model from the resulting register_values once it arrives (see
+        # _ensure_device_info/_on_event's own "register_values" handling).
+        # mac -> last-requested monotonic time, so this doesn't re-send
+        # poll_registers every single known_devices snapshot for a node
+        # that just isn't answering right now.
+        self._mesh_info_requested_at: dict[str, float] = {}
 
         self._poll_timer = QTimer(self)
         self._poll_timer.timeout.connect(self._poll_gateway)
@@ -514,6 +525,7 @@ class MainWindow(QMainWindow):
             # not just theoretical - same hazard DryerStatusPoller's
             # STOP_WAIT_MS comment is about), not just a leak.
             self._device_info = {}
+            self._mesh_info_requested_at = {}
             self.rtsnow_page.update_devices([], {})
 
     def _on_connect_clicked(self):
@@ -958,6 +970,29 @@ class MainWindow(QMainWindow):
             self._log(f"Received {len(values)} register(s) from {mac} starting at {start_register}.")
             if self.node_detail_page.current_mac() == mac:
                 self.node_detail_page.show_register_values(start_register, values)
+            # Mesh fallback for a device with no IP (see _ensure_device_
+            # info's own comment) - only fills in equipmentType/model if
+            # nothing's cached yet, so a device that DOES have a direct-IP
+            # answer (a richer /api/data response) never gets overwritten
+            # by this narrower, register-only source.
+            if mac is not None and mac not in self._device_info:
+                model_type_index = MODBUS_REG_MODEL_TYPE - start_register
+                if 0 <= model_type_index < len(values):
+                    info = decode_model_type_register(values[model_type_index])
+                    if info is not None:
+                        self._device_info[mac] = info
+                        rtsnow_devices = [dev for dev in self.known_devices.values() if dev.project_name == "RTSNow"]
+                        self.rtsnow_page.update_devices(rtsnow_devices, self._device_info)
+                        # Live-upgrade the currently open page if the user
+                        # is already looking at this exact device - e.g.
+                        # clicked SHED before this answer arrived, so it
+                        # was still showing the generic Node Detail page.
+                        dev = self.known_devices.get(mac)
+                        if dev is not None and (
+                            self.node_detail_page.current_mac() == mac
+                            or self.dryer_detail_page.current_mac() == mac
+                        ):
+                            self._show_device_page(dev)
         elif event == "espnow_ota_start_ack":
             if self._espnow_ota_transfer is not None:
                 self._espnow_ota_transfer.on_start_ack(obj.get("mac"), bool(obj.get("ok")), obj.get("message", ""))
@@ -1004,16 +1039,35 @@ class MainWindow(QMainWindow):
         if current_dryer_mac and current_dryer_mac in self.known_devices:
             self.dryer_detail_page.refresh_if_current(self.known_devices[current_dryer_mac])
 
+    # Only re-sends a mesh poll_registers fallback request for the same
+    # mac this often - it's relayed over ESP-NOW and a persistently weak-
+    # link node (the exact case this exists for) may just not answer for a
+    # while, so resending every single known_devices snapshot would be
+    # needless mesh chatter for no better odds of success.
+    _MESH_INFO_RETRY_INTERVAL_S = 20.0
+
     def _ensure_device_info(self, dev: KnownDevice):
         """Kicks off a one-shot equipmentType/model fetch for `dev` if it
         doesn't have one cached (or in flight) yet - see _device_info's
-        comment. Never retries on its own: a device that's unreachable
-        right now (no ip yet, offline) just keeps the default "?" icon/
-        NodeDetailPage routing until a later known_devices snapshot calls
-        this again for it (every POLL_INTERVAL_MS) and it succeeds."""
+        comment. Never retries on its own for the direct-IP path: a device
+        that's unreachable right now (no ip yet, offline) just keeps the
+        default "?" icon/NodeDetailPage routing until a later known_devices
+        snapshot calls this again for it (every POLL_INTERVAL_MS) and it
+        succeeds. A device with NO ip at all (e.g. Dryer SHED's
+        persistently weak link - no WiFi association, so the direct HTTP
+        path can never work regardless of retries) instead falls back to
+        asking over the ESP-NOW mesh via poll_registers - see this file's
+        own "register_values" handling for where that answer gets decoded
+        back into equipmentType/model."""
         if dev.mac in self._device_info or dev.mac in self._info_fetchers:
             return
         if not dev.ip:
+            last_requested = self._mesh_info_requested_at.get(dev.mac)
+            if last_requested is not None and time.monotonic() - last_requested < self._MESH_INFO_RETRY_INTERVAL_S:
+                return
+            self._mesh_info_requested_at[dev.mac] = time.monotonic()
+            self._send({"cmd": "poll_registers", "mac": dev.mac},
+                       f"poll_registers {dev.mac} (equipment-type fallback, no IP)")
             return
         fetcher = DeviceInfoFetcher(dev.mac, dev.ip)
         fetcher.info_received.connect(self._on_device_info_received)

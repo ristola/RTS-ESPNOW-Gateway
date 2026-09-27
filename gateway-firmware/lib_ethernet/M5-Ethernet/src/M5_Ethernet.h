@@ -38,7 +38,18 @@
 // #else
 // #define MAX_SOCK_NUM 8
 // #endif
-#define MAX_SOCK_NUM 2
+// Bumped from the upstream default of 2 to the W5500's actual max (8) -
+// gateway-firmware runs TWO listening EthernetServers at once on this
+// chip (port 5055's JSON protocol server AND port 80's HTTP status
+// site), each needing at least one socket just to listen, plus more for
+// active clients and Ethernet.maintain()'s own transient DHCP-renewal
+// socket. With only 2 total, the two servers were starving each other -
+// symptom was the HTTP page working inconsistently (logo.gif failing to
+// load, multi-second page/menu load times) whenever the JSON server
+// happened to be holding a connection. A few bytes of RAM per socket
+// (see this section's own comment) is a trivial cost against this
+// board's real RAM budget.
+#define MAX_SOCK_NUM 8
 
 // By default, each socket uses 2K buffers inside the Wiznet chip.  If
 // MAX_SOCK_NUM is set to fewer than the chip's maximum, uncommenting
