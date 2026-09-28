@@ -2259,21 +2259,26 @@ class DryerDetailPage(QWidget):
         # one block - see show_register_values()), then narrowed to just
         # 40010-40021 once this poller's own response replaced it.
         live = {r["reg"]: r for r in data.get("registers", []) if r.get("present")}
-        # deviceRegisters carries no "ageMs" at all (the firmware reads
+        # deviceRegisters mostly carries no "ageMs" (the firmware reads
         # these straight from the live Modbus table on every request, so
-        # there's no staleness for it to report - see DryerWebServer.cpp's
-        # own comment) - confirmed live: with WiFi enabled (this direct-IP
-        # path), the Registers dialog showed a permanent "?" for exactly
-        # these 9 rows while 40010+ ticked up normally, disappearing
-        # entirely with WiFi off (show_register_values()'s mesh path
-        # stamps everything with one receivedAt instead). Since a live
-        # Modbus-table read really is only as fresh as this exact HTTP
-        # response, stamping it with the same received_at instant here is
-        # honest, not fabricated - it's "how long ago we last confirmed
-        # this value", identical in spirit to receivedAt on the mesh path.
+        # there's usually no staleness for it to report - see
+        # DryerWebServer.cpp's own comment) - confirmed live: with WiFi
+        # enabled (this direct-IP path), the Registers dialog showed a
+        # permanent "?" for exactly these 9 rows while 40010+ ticked up
+        # normally, disappearing entirely with WiFi off
+        # (show_register_values()'s mesh path stamps everything with one
+        # receivedAt instead). Since a live Modbus-table read really is
+        # only as fresh as this exact HTTP response, stamping it with the
+        # same received_at instant here is honest, not fabricated - it's
+        # "how long ago we last confirmed this value", identical in spirit
+        # to receivedAt on the mesh path. Two of these nine (Board Temp/
+        # SPI CRC Error) now DO carry a real firmware ageMs (see
+        # DryerRegisters::registerAgeMs()) - left untouched here rather
+        # than overwritten, so the dialog shows the node's own update
+        # cadence for those specifically instead of this poll's.
         received_at = time.monotonic()
         for r in data.get("deviceRegisters", []):
-            live[r["reg"]] = {**r, "receivedAt": received_at}
+            live[r["reg"]] = r if "ageMs" in r else {**r, "receivedAt": received_at}
         self._last_live = live
         for reg, tiles in self._register_tiles.items():
             reg_data = live.get(reg)
