@@ -43,6 +43,11 @@ enum RTSNOW_MessageType : uint8_t
     RTSNOW_REBOOT = 0x31,             // unicast, gateway -> node: no payload - node restarts shortly after receiving
     RTSNOW_REQUEST_REGISTERS = 0x32,  // unicast, gateway -> node: no payload - "send me your current register block"
     RTSNOW_REGISTER_VALUES = 0x33,    // unicast, node -> gateway: RTSNOW_RegisterBlock
+    // Write one register - see RTSNOW_WriteRegister's own comment for why
+    // this is a real, physical-equipment-affecting command (e.g. starting/
+    // stopping a dryer), not just a config value like RTSNOW_SET_SETTING.
+    RTSNOW_WRITE_REGISTER = 0x34,     // unicast, gateway -> node: RTSNOW_WriteRegister
+    RTSNOW_WRITE_REGISTER_ACK = 0x35, // unicast, node -> gateway: RTSNOW_WriteRegisterAck
 
     // Firmware update over ESP-NOW, for a node with no usable WiFi-OTA
     // path (no IP at all, or a link too unreliable for a sustained TCP
@@ -294,6 +299,34 @@ struct RTSNOW_RegisterBlock
     uint16_t startRegister;  // first register number this block covers, e.g. 40001
     uint16_t registerCount;  // how many of `values` are valid, <= 64
     uint16_t values[64];
+};
+#pragma pack(pop)
+
+// Requests a single register write - unlike RTSNOW_SET_SETTING (a named
+// config key like "spiAddress"), this is project-neutral by register
+// NUMBER, same as RTSNOW_RegisterBlock, and is meant for real physical-
+// equipment-affecting writes (e.g. SPI-IM's Machine Status register 40014
+// starts/stops an actual dryer) - a receiving node should apply exactly
+// the same validation/safety path a locally-connected client (e.g. Modbus
+// TCP) would use for the same register, not a shortcut around it. value
+// is a float (not the raw uint16 RTSNOW_RegisterBlock reports) to match
+// SPI-IM's own EquipmentModel::writeRegister(uint16_t, float) signature
+// exactly - some registers are physically 4-byte float writes over
+// SPI-CCP, not scaled integers, so passing a float through unchanged
+// avoids reinventing per-register scaling here.
+#pragma pack(push, 1)
+struct RTSNOW_WriteRegister
+{
+    uint16_t reg;
+    float value;
+};
+#pragma pack(pop)
+
+#pragma pack(push, 1)
+struct RTSNOW_WriteRegisterAck
+{
+    uint16_t reg;   // echoed back
+    uint8_t ok;     // 0 if this node doesn't know how to write this register, or the write itself failed
 };
 #pragma pack(pop)
 

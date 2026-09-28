@@ -1,4 +1,5 @@
 import math
+import time
 from collections import deque
 
 from PySide6.QtCore import Qt, QPointF, QTimer, Signal
@@ -25,11 +26,109 @@ from PySide6.QtWidgets import (
 )
 
 from src.gateway.dryer_status_poller import DryerStatusPoller
-from src.gateway.models import KnownDevice
+from src.gateway.models import MODBUS_REG_MODEL_TYPE, KnownDevice, decode_model_type_register
 from src.gateway.register_writer import RegisterWriter
 from src.gateway.setting_writer import SettingWriter
 from src.ui.pages.node_detail_page import BAUD_RATES, EQUIPMENT_TYPES, MODELS_BY_EQUIPMENT
 from src.ui.pages.node_network_page import format_rssi
+
+# Every register ever passed through EquipmentModel::setFloatRegister()
+# (base class pollProcessSetpoint/pollProcessDelta/pollDewTrigger/
+# pollProcessTemp/pollReturnTemp/pollDewPoint, plus each dryer model's own
+# .cpp overrides for its extra temp channels - Regen/Aux/Bed temps etc.)
+# gets marked signed_=true by firmware and stored as a raw two's-
+# complement int16 bit pattern, e.g. -25 -> 0xFFE7 -> 65511 unsigned. The
+# direct-IP /api/data path already reinterprets these correctly (see
+# EquipmentModel::isSignedRegister()/DryerWebServer.cpp's own comment on
+# it) since the node itself does the conversion - this project-side
+# mirror is only needed for the mesh path (show_register_values() below),
+# where the raw RTSNOW_RegisterBlock carries plain uint16 words with no
+# signed-ness metadata at all. This set is every register number any
+# model's own setFloatRegister() call site uses (grep the firmware repo
+# for "setFloatRegister(" to re-verify) - deliberately matching firmware's
+# per-register signed_ flag exactly rather than guessing from register
+# names, since e.g. Process Setpoint (40010)/Process Delta (40011) go
+# through the same signed path even though a human wouldn't necessarily
+# guess a setpoint could ever be negative.
+_SIGNED_MESH_REGISTERS = frozenset(
+    {40010, 40011, 40012, 40015, 40016, 40017, 40018, 40019, 40020, 40021, 40022, 40023}
+)
+
+
+def _reinterpret_signed16(value: int) -> int:
+    return value - 0x10000 if value > 0x7FFF else value
+
+
+# Mirrors DryerWebServer.cpp's kDeviceRegNames (40001-40009, the XBEE
+# SETUP block - identical across every model) - needed here because the
+# mesh path (show_register_values() below) has no equivalent of the
+# node's own direct-IP /api/data response, which already carries names
+# per-register (see DryerWebServer.cpp's ActiveModel->registerName()/
+# kDeviceRegNames). Without this, a mesh-only device's Registers dialog
+# showed a completely blank Name column and a single uniform age for
+# every row (the whole mesh snapshot's one receivedAt) - confirmed live,
+# looking so different from a direct-IP device's own (named, individually-
+# aged) Registers dialog that it read as two unrelated features rather
+# than the same view of two different transports.
+_XBEE_REGISTER_NAMES = {
+    40001: "Software Version",
+    40002: "SPI Station ID",
+    40003: "SPI Baud Rate",
+    40004: "Model Type",
+    40005: "RSSI",
+    40006: "Write Enable",
+    40007: "Board Temp",
+    40008: "Xbee Radio Voltage",
+    40009: "SPI CRC Error",
+}
+
+# Mirrors EquipmentModel::registerName() (40010-40017) - the "STANDARD
+# COMMON SPI DATA" block, worded identically across every dryer/
+# crystallizer model.
+_COMMON_REGISTER_NAMES = {
+    40010: "Process Set Point",
+    40011: "Process Limit Delta",
+    40012: "Process Temp",
+    40013: "Process Status",
+    40014: "Machine Status",
+    40015: "Return Temp",
+    40016: "Dew Point",
+    40017: "Dew Point Alarm Trigger",
+}
+
+# Mirrors each model's own registerName() override for its extended block
+# (40018+) - see DryerFC.cpp/DryerFN.cpp/DryerADV.cpp/DryerFD.cpp. DryerCD
+# and both Crystallizer models don't override registerName() at all (no
+# entry here), so they fall back to _COMMON_REGISTER_NAMES only, same as
+# the firmware itself does via EquipmentModel::registerName()'s default.
+_MODEL_REGISTER_NAMES = {
+    "FC": {40018: "Regen Temp", 40019: "Regen Out Temp", 40020: "Aux 1 Temp", 40021: "Aux 2 Temp"},
+    "FN": {40018: "Regen Temp", 40019: "Regen Out Temp", 40020: "Aux 1 Temp", 40021: "Aux 2 Temp"},
+    "ADV": {
+        40018: "Left Bed Heater", 40019: "Left Bed Outlet",
+        40020: "Right Bed Heater", 40021: "Right Bed Outlet",
+        40022: "Process 2 Temp", 40023: "Return 2 Temp",
+    },
+    "FD": {
+        40018: "Regen Temp", 40019: "Regen Out Temp",
+        40020: "Dryer Inlet Temp", 40021: "Dryer Outlet Temp",
+        40022: "Process 2 Temp", 40023: "Return 2 Temp",
+        40024: "Inlet Temp", 40025: "Throat Temp",
+        40026: "Left Bed Temp", 40027: "Right Bed Temp",
+        40028: "Hopper 1 Temp", 40029: "Hopper 2 Temp", 40030: "Hopper 3 Temp",
+        40031: "Hopper 4 Temp", 40032: "Hopper 5 Temp", 40033: "Hopper 6 Temp",
+        40034: "Process Dewpoint", 40035: "Return Dewpoint",
+    },
+}
+
+
+def _mesh_register_name(reg: int, model: str) -> str:
+    if reg in _XBEE_REGISTER_NAMES:
+        return _XBEE_REGISTER_NAMES[reg]
+    if reg in _COMMON_REGISTER_NAMES:
+        return _COMMON_REGISTER_NAMES[reg]
+    return _MODEL_REGISTER_NAMES.get(model, {}).get(reg, "")
+
 
 # Machine Status (40014) raw values -> operator-facing text. Only 0/1 are
 # confirmed meanings so far (see DataSheets/SPI-CCP Notes - Dryer and
@@ -843,6 +942,12 @@ class DryerDetailPage(QWidget):
     # it: friendlyName() there is read-only, sourced from the same
     # RTS-NOW-set name), unlike Equipment/Model/SPI Address/Baud Rate.
     rename_requested = Signal(str, str)
+    # mac, reg, value - a register write for a node with no IP at all
+    # (RegisterWriter's direct http://<ip>/api/writeregister can't reach
+    # it). Goes out as RTSNOW_WRITE_REGISTER over the mesh instead - see
+    # main_window.py's connection to this and its "write_register_ack"
+    # handling, which calls back into on_write_register_ack() below.
+    write_register_requested = Signal(str, int, float)
 
     def __init__(self):
         super().__init__()
@@ -866,6 +971,12 @@ class DryerDetailPage(QWidget):
         # stop showing "Stopping.../Starting..." and go back to the
         # normal Machine Stopped/Running text.
         self._machine_status_pending: str | None = None
+        # True while a mesh-based clear-alarms write (reg 40014 = 3, see
+        # _on_clear_alarms_clicked) is awaiting its write_register_ack -
+        # both that and a normal start/stop toggle write the same
+        # register, so on_write_register_ack() needs this to tell which
+        # one a reg-40014 ack is actually confirming.
+        self._mesh_clear_alarms_pending = False
         # Device-level settings (not SPI-CCP dryer registers, so not
         # part of _last_live) - top-level /api/data fields, read by
         # _on_configuration_menu's popup to show current values when
@@ -1241,7 +1352,12 @@ class DryerDetailPage(QWidget):
         # RegisterWriter/_pending_writers plumbing as _write_register,
         # just with no tile to update afterward.
         if not self._ip:
-            QMessageBox.warning(self, "No IP", "This node has no known IP address (mesh-only node).")
+            # No direct IP at all (e.g. Dryer SHED) - over the mesh
+            # instead. See on_write_register_ack()'s own reg==40014
+            # branch for how the result comes back.
+            if self._mac is not None:
+                self._mesh_clear_alarms_pending = True
+                self.write_register_requested.emit(self._mac, 40014, 3.0)
             return
         writer = RegisterWriter(self._ip, 40014, 3.0)
         self._pending_writers.append(writer)
@@ -1288,15 +1404,25 @@ class DryerDetailPage(QWidget):
                 "Machine Status hasn't been confirmed by a poll yet - not safe to toggle.",
             )
             return
-        if not self._ip:
-            QMessageBox.warning(self, "No IP", "This node has no known IP address (mesh-only node).")
-            return
-
         target = "0" if current == "1" else "1"
         self._machine_status_pending = target
         self._set_machine_status_display(
             "Stopping..." if target == "0" else "Starting...", _MACHINE_STATUS_COLOR_UNKNOWN
         )
+
+        if not self._ip:
+            # No direct IP at all (e.g. Dryer SHED) - over the mesh
+            # instead. The optimistic "Stopping.../Starting..." text
+            # above still applies; on_write_register_ack()'s reg==40014
+            # branch rolls it back on an outright rejection, same as
+            # on_error below does for the direct-IP path. A genuine
+            # success just leaves it in place until the next
+            # register_values broadcast (already arriving every ~10s
+            # regardless of IP) confirms the real transition via
+            # _on_status_received's own pending-value check.
+            if self._mac is not None:
+                self.write_register_requested.emit(self._mac, 40014, float(target))
+            return
 
         writer = RegisterWriter(self._ip, 40014, float(target))
         self._pending_writers.append(writer)
@@ -1813,7 +1939,17 @@ class DryerDetailPage(QWidget):
                 table.setItem(row, 0, QTableWidgetItem(str(reg)))
                 table.setItem(row, 1, QTableWidgetItem(str(reg_data.get("name", ""))))
                 table.setItem(row, 2, QTableWidgetItem(str(reg_data.get("value", ""))))
-                age_ms = reg_data.get("ageMs")
+                # receivedAt (mesh path - show_register_values()) wins over
+                # ageMs (direct-IP path - _on_status_received()'s own
+                # /api/data registers) when both could theoretically be
+                # present, since a live-computed age is always more
+                # current than one frozen at whatever instant that JSON
+                # was fetched.
+                received_at = reg_data.get("receivedAt")
+                if received_at is not None:
+                    age_ms = int((time.monotonic() - received_at) * 1000)
+                else:
+                    age_ms = reg_data.get("ageMs")
                 age_text = f"{age_ms // 1000}s ago" if age_ms is not None else "?"
                 table.setItem(row, 3, QTableWidgetItem(age_text))
             table.setFixedHeight(
@@ -1881,7 +2017,15 @@ class DryerDetailPage(QWidget):
 
     def _write_register(self, reg: int, value: float, tile: "_Tile"):
         if not self._ip:
-            QMessageBox.warning(self, "No IP", "This node has no known IP address (mesh-only node).")
+            # No direct IP at all (e.g. Dryer SHED) - over the mesh
+            # instead. tile already shows "..." (see
+            # _prompt_write_register) - on_write_register_ack() rolls it
+            # back on an outright rejection; a genuine success just
+            # leaves it until the next register_values broadcast (already
+            # arriving every ~10s regardless of IP) confirms the real
+            # value via _on_status_received.
+            if self._mac is not None:
+                self.write_register_requested.emit(self._mac, reg, value)
             return
         writer = RegisterWriter(self._ip, reg, value)
         self._pending_writers.append(writer)
@@ -2006,6 +2150,22 @@ class DryerDetailPage(QWidget):
         if is_new_selection:
             self._stop_poller()
             self.model_label.setText("")
+            # Without this, the PREVIOUS device's register values (temps,
+            # dew point, setpoints...) stayed on screen - still fully
+            # populated, just now silently mislabeled under the NEW
+            # device's name - until the new device's own poller happened
+            # to answer. Confirmed live switching Office -> Shed: Shed's
+            # page showed Office's numbers for however long Shed's own
+            # (often slower, mesh-only) response took to arrive. Wrong
+            # temperature/dew-point readings displayed against the wrong
+            # physical dryer is a real safety concern, not just a cosmetic
+            # one, so this clears to "--" immediately on every device
+            # switch rather than leaving stale-but-plausible-looking data
+            # up a moment longer.
+            self._last_live = {}
+            for tiles in self._register_tiles.values():
+                for tile in tiles:
+                    tile.set_value("--")
             if dev.ip:
                 self._start_poller(dev.ip)
 
@@ -2032,6 +2192,51 @@ class DryerDetailPage(QWidget):
         identical reasoning."""
         self._stop_poller()
 
+    def show_register_values(self, start_register: int, values: list[int]):
+        """Feeds a raw mesh register_values snapshot (see main_window.py's
+        "register_values" handling) into the exact same rendering path
+        _on_status_received already uses for a direct-IP node's own
+        /api/data JSON - reconstructed from the raw {reg: value} array
+        using this project's own well-known fixed register numbers (see
+        RTSNow-SPI-CCP's ModbusRegisterMap.h), not anything mesh-protocol-
+        specific. Used for a node with no IP at all (e.g. Dryer SHED's
+        persistently weak link) - /api/data can never be reached there,
+        but this same register block is already broadcast over ESP-NOW
+        every ~10s regardless of IP (plus once on demand whenever
+        main_window.py's _ensure_device_info sends poll_registers).
+
+        No per-register "ageMs" here (unlike the direct-IP path, where the
+        node itself reports how long ago its own SPI-IM poll touched each
+        register - see DryerWebServer.cpp's registerAgeMs()) - the whole
+        block arrives as one mesh snapshot at a single instant, so there's
+        only one meaningful age: how long ago *this snapshot* was
+        received. receivedAt captures that instant; the Registers dialog's
+        refresh_table() computes a live, ticking-up age from it on every
+        1s redraw, rather than the frozen "?" you'd get with no age field
+        at all (ageMs would need to itself keep advancing between mesh
+        updates, not just be set once at ingest)."""
+        raw = {start_register + i: value for i, value in enumerate(values)}
+        model_info = decode_model_type_register(raw.get(MODBUS_REG_MODEL_TYPE, -1)) or {}
+        model = model_info.get("model", "")
+        received_at = time.monotonic()
+        data = {
+            "equipmentType": model_info.get("equipmentType", "?"),
+            "model": model_info.get("model", "?"),
+            "spiAddress": raw.get(40002, "?"),
+            "spiBaudRate": raw.get(40003, "?"),
+            "registers": [
+                {
+                    "reg": reg,
+                    "name": _mesh_register_name(reg, model),
+                    "value": _reinterpret_signed16(value) if reg in _SIGNED_MESH_REGISTERS else value,
+                    "present": True,
+                    "receivedAt": received_at,
+                }
+                for reg, value in raw.items()
+            ],
+        }
+        self._on_status_received(data)
+
     def _on_status_received(self, data: dict):
         self.model_label.setText(f"{data.get('equipmentType', '?')} / {data.get('model', '?')}")
         self._last_equipment_type = data.get("equipmentType", "?")
@@ -2039,7 +2244,23 @@ class DryerDetailPage(QWidget):
         self._last_spi_address = data.get("spiAddress", "?")
         self._last_spi_baud = data.get("spiBaudRate", "?")
 
+        # The node's own /api/data splits these into two separate top-
+        # level arrays - "registers" (per-model, e.g. 40010-40021, each
+        # entry carrying "present"/"ageMs") and "deviceRegisters" (the
+        # XBEE SETUP block, 40001-40009 - Software Version/SPI Station
+        # ID/Baud/Model Type/RSSI/etc., see DryerWebServer.cpp's own
+        # comment on why that's read from the live Modbus table rather
+        # than ActiveModel - always present, no "present"/"ageMs" fields
+        # at all). Merging only "registers" here used to make 40001-40009
+        # silently vanish from _last_live/the Registers dialog the moment
+        # a direct-HTTP response arrived - confirmed live: the dialog
+        # showed the full 40001-40021 range right after opening (from an
+        # initial mesh-sourced snapshot, which flattens everything into
+        # one block - see show_register_values()), then narrowed to just
+        # 40010-40021 once this poller's own response replaced it.
         live = {r["reg"]: r for r in data.get("registers", []) if r.get("present")}
+        for r in data.get("deviceRegisters", []):
+            live[r["reg"]] = r
         self._last_live = live
         for reg, tiles in self._register_tiles.items():
             reg_data = live.get(reg)
@@ -2097,3 +2318,39 @@ class DryerDetailPage(QWidget):
         # reaching the gateway, and how well") through a direct-HTTP
         # outage like this one, rather than going blank.
         pass
+
+    def on_write_register_ack(self, reg: int, ok: bool, message: str):
+        """Called by main_window.py's "write_register_ack" handling for
+        this exact device - the mesh-path completion for whichever of
+        _on_clear_alarms_clicked/_on_machine_status_clicked/
+        _write_register emitted write_register_requested for this
+        register. No per-write value tracking here on success - a genuine
+        success is just left for the next automatic register_values
+        broadcast to confirm for real (see each of those methods' own
+        comment), same as the direct-IP RegisterWriter path already
+        relies on the next round-robin poll for."""
+        if reg == 40014:
+            # Both a clear-alarms command and a start/stop toggle write
+            # this same register - _mesh_clear_alarms_pending is what
+            # tells them apart (see _on_clear_alarms_clicked's own
+            # comment).
+            if self._mesh_clear_alarms_pending:
+                self._mesh_clear_alarms_pending = False
+                if ok:
+                    QMessageBox.information(self, "Alarms cleared", "Clear-alarms command sent.")
+                else:
+                    QMessageBox.warning(self, "Clear failed", message)
+                return
+            if not ok:
+                self._machine_status_pending = None
+                self._refresh_machine_status_display()
+                QMessageBox.warning(self, "Write failed", f"Register 40014: {message}")
+            return
+
+        if not ok:
+            for tile in self._register_tiles.get(reg, []):
+                try:
+                    tile.set_value(str(self._last_live.get(reg, {}).get("value", "--")))
+                except RuntimeError:
+                    pass
+            QMessageBox.warning(self, "Write failed", f"Register {reg}: {message}")

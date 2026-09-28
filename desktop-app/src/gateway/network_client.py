@@ -21,6 +21,12 @@ class NetworkGatewayClient(QThread):
     it on a TCP port instead of a serial port. Uses raw `socket` (blocking,
     own thread) rather than QTcpSocket, structurally parallel to
     GatewayClient.run()'s own buffer-accumulate-and-split-on-"\\n" loop.
+
+    Port defaults to 80, not a dedicated JSON-only port anymore - the
+    gateway firmware now shares one TCP listener between this JSON
+    protocol and its own HTML status site, telling them apart by each
+    connection's first line ("GET " vs "{") - see gateway-firmware's
+    kHttpPort for the full reasoning behind the merge.
     """
 
     event_received = Signal(dict)
@@ -28,7 +34,7 @@ class NetworkGatewayClient(QThread):
     error = Signal(str)
     disconnected = Signal()
 
-    def __init__(self, host: str, port: int = 5055, connect_timeout: float = 3.0):
+    def __init__(self, host: str, port: int = 80, connect_timeout: float = 3.0):
         super().__init__()
         self._host = host
         self._port = port

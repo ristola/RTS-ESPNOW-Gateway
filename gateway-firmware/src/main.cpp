@@ -34,7 +34,7 @@
 #include <utility/w5100.h>  // for W5100.init() directly - see gateway_ethernet_begin()'s own comment
 #include "secrets.h"         // GATEWAY_WIFI_SSID/PASSWORD - WiFi fallback only, gitignored
 #include <ESPmDNS.h>          // WiFi-fallback mDNS only - see kMdnsHostname's own comment for the Ethernet story
-#include "rtslogo.h"          // RTS logo, served at /logo.gif by the HTTP status page below
+#include "rtslogo.h"          // RTS logo, inlined as a data: URI directly into the HTTP status page's own HTML
 #endif
 
 #include "rtsnow_protocol.h"
@@ -149,6 +149,20 @@ namespace
         // friendlyName rename meant for the real target applying to the
         // chosen non-relay-capable "relay" instead).
         bool supportsRelay = false;
+        // Last RTSNOW_RegisterBlock received from this device - either its
+        // own ~10s heartbeat piggyback, or a reply to an explicit
+        // RTSNOW_REQUEST_REGISTERS (see do_request_registers_send) - see
+        // the RTSNOW_REGISTER_VALUES case in on_espnow_recv, the only
+        // writer of these three fields. Cached here so the Modbus TCP
+        // bridge (see "Modbus TCP bridge" section below) can answer a
+        // poll instantly from whatever's already on hand instead of doing
+        // a live mesh round-trip per request - deliberate, see that
+        // section's own comment for why a real Modbus master polling
+        // this gateway needs a fast, predictable response far more than
+        // it needs the absolute freshest reading.
+        RTSNOW_RegisterBlock lastRegisters{};
+        bool hasRegisters = false;
+        uint32_t registersUpdatedMs = 0;
     };
     constexpr int kMaxKnownDevices = 32;
     KnownDevice s_known_devices[kMaxKnownDevices];
@@ -379,12 +393,20 @@ namespace
 
     // wifiRssi defaults to RTSNOW_RSSI_UNKNOWN, boardName to "", and
     // neighborCount to kNeighborCountNotProvided for callers
-    // (RTSNOW_ANNOUNCE) that have none of these - only ever overwrites
-    // the stored value when the caller actually has a fresh one
-    // (RTSNOW_HEARTBEAT), so an announce arriving after a heartbeat
-    // doesn't blank out already-known-good data.
+    // (RTSNOW_ANNOUNCE) that have none of these at all. wifiRssiFresh is
+    // what actually distinguishes that case from RTSNOW_HEARTBEAT, which
+    // DOES always carry a real wifiRssi reading - including an explicit
+    // RTSNOW_RSSI_UNKNOWN when the node's own WiFi is genuinely
+    // disconnected right now (see rtsnow_node.cpp's own hb.wifiRssi
+    // assignment). Without this flag, that real "disconnected" reading
+    // and "this caller has no idea" looked identical (both
+    // RTSNOW_RSSI_UNKNOWN), so a node that dropped WiFi kept showing its
+    // last-known-good RSSI forever instead of clearing - confirmed live
+    // via the desktop app's dryer detail page still showing a stale WiFi
+    // reading for a node running mesh-only.
     void note_known_device(const uint8_t mac[6], const RTSNOW_DeviceIdentity &identity,
-                            int8_t wifiRssi = RTSNOW_RSSI_UNKNOWN, const char *boardName = "",
+                            int8_t wifiRssi = RTSNOW_RSSI_UNKNOWN, bool wifiRssiFresh = false,
+                            const char *boardName = "",
                             uint8_t neighborCount = kNeighborCountNotProvided,
                             const RTSNOW_NeighborInfo *neighbors = nullptr)
     {
@@ -401,7 +423,7 @@ namespace
                 s_known_devices[i].firmwareVersionMajor = identity.firmwareVersionMajor;
                 s_known_devices[i].firmwareVersionMinor = identity.firmwareVersionMinor;
                 s_known_devices[i].firmwareVersionPatch = identity.firmwareVersionPatch;
-                if (wifiRssi != RTSNOW_RSSI_UNKNOWN)
+                if (wifiRssiFresh)
                     s_known_devices[i].wifiRssi = wifiRssi;
                 if (boardName[0] != '\0')
                 {
@@ -1208,6 +1230,33 @@ namespace
         return nullptr;
     }
 
+    // Same fire-and-forget caveat as do_reboot_send/do_request_registers_
+    // send above - a successful send here only means the ESP-NOW packet
+    // went out, not that the node accepted the write. Real confirmation
+    // is RTSNOW_WRITE_REGISTER_ACK (see that message's own receive-side
+    // handling) - unlike those two, this one is real-equipment-affecting
+    // (e.g. starting/stopping a dryer), so the caller should actually
+    // wait for that ack rather than treating "send succeeded" as "write
+    // applied".
+    const char *do_write_register_send(const uint8_t mac[6], uint16_t reg, float value)
+    {
+        int idx = find_known_device_by_mac(mac);
+        if (idx < 0)
+            return "unknown MAC - it must have announced/heartbeated at least once (see `list`)";
+        SendTarget dest = resolve_send_target(idx);
+        ensure_peer(dest.mac);
+        RTSNOW_WriteRegister payload{};
+        payload.reg = reg;
+        payload.value = value;
+        for (uint8_t i = 0; i < kRemoteControlResendCount; i++)
+        {
+            send_to(dest.mac, RTSNOW_WRITE_REGISTER, &payload, sizeof(payload), dest.destinationID);
+            if (i + 1 < kRemoteControlResendCount)
+                delay(kRemoteControlResendGapMs);
+        }
+        return nullptr;
+    }
+
     // ---- Firmware update - RECEIVING side (this gateway being flashed,
     // not pushing to a node) ----
     //
@@ -1724,28 +1773,60 @@ namespace
         s_mdns_eth_udp.endPacket();
     }
 
+    // Shared by the JSON protocol server AND the HTML status site (see
+    // TcpClientState's own comment for why these two are now one and the
+    // same listener) - port 80 specifically so a browser never needs to
+    // type a port number, matching this site's whole existence as "the
+    // human-friendly one." The desktop app / OTA tooling now also
+    // connects here instead of a separate port - see this constant's own
+    // history below for why.
+    constexpr uint16_t kHttpPort = 80;
+    // How long a connection gets to send its very first line before this
+    // server gives up on it - see TcpClientState::protocolKnown's own
+    // comment for why this only ever applies before that first line
+    // arrives, never to an established persistent session afterward.
+    constexpr uint32_t kHttpClientTimeoutMs = 3000;
+
     // M5_Ethernet's own M5_Ethernet.h now patches MAX_SOCK_NUM up to the
     // W5500's real max of 8 (see that file's own comment - upstream
-    // hardcoded it to 2, which starved this gateway's two listening
-    // servers against each other once the HTTP status site was added
-    // alongside the JSON protocol server). Budget across all 8: JSON
-    // listener(1) + these clients(1) + HTTP listener(1) + HTTP clients
-    // (kMaxEthHttpClients, 3 - see that constant's own comment for why
-    // it needs real headroom, unlike this one) + the Ethernet mDNS
-    // responder's own UDP socket(1) + a spare for Ethernet.maintain()'s
-    // transient DHCP-renewal socket(1) = 8 of 8, fully budgeted rather
-    // than reserving slack neither transport actually needs.
-    constexpr uint8_t kMaxEthTcpClients = 1;
+    // hardcoded it to 2). Budget across all 8: this shared listener(1) +
+    // these clients(3) + Modbus listener(1) + Modbus clients(3, see
+    // kMaxEthModbusClients's own comment) = 8 of 8.
+    //
+    // Used to be two entirely separate servers on two separate ports -
+    // this one (JSON protocol, port 5055) with just 1 client slot, and a
+    // second one (HTML status site, port 80) with its own 1-3 client
+    // slots that kept getting fought over against Modbus's own growing
+    // needs (see kMaxEthModbusClients's own comment for that whole
+    // back-and-forth). Confirmed live: however that fight was resolved,
+    // *something* ended up starved - either the status page couldn't
+    // handle a page's several simultaneous sub-requests, or (once the
+    // logo was inlined to fix that) simply navigating between pages
+    // could lose the race against a still-in-flight background
+    // fetch('/api/status') from the page just left, since the W5500's
+    // listener needs a moment to re-arm between connections and 1 slot
+    // gives it zero room to do that reliably.
+    //
+    // Merging the two servers into ONE shared listener+client pool fixes
+    // this properly instead of continuing to reshuffle a zero-sum split:
+    // a client's very first line tells you which protocol it's speaking
+    // (an HTTP request always starts "GET ", a JSON command always
+    // starts '{', anything else is this project's own legacy text
+    // command - see service_tcp_client()'s own dispatch) so one pool can
+    // serve both, and whichever protocol needs more concurrent
+    // connections at any given moment can actually use the room instead
+    // of it sitting reserved-but-idle in the other protocol's separate,
+    // rigid allocation.
+    constexpr uint8_t kMaxEthTcpClients = 3;
     // WiFi (ESP32's native lwIP) has no equivalent hardware ceiling - this
-    // used to share the Ethernet constant above (=1) for no real reason,
-    // which meant the desktop app's own long-lived monitoring connection
-    // silently starved out any other WiFi TCP client, including an OTA
-    // push tool trying to connect at the same time (confirmed live: an
-    // `ota_start` attempt got an immediate connection reset while the
-    // desktop app was connected). Room for a few concurrent clients here
-    // costs nothing real and avoids that entirely for the common case.
-    constexpr uint8_t kMaxWifiTcpClients = 4;
-    constexpr uint16_t kGatewayTcpPort = 5055;
+    // used to share the Ethernet constant above for no real reason, which
+    // meant the desktop app's own long-lived monitoring connection could
+    // starve out another WiFi client, including an OTA push tool trying
+    // to connect at the same time (confirmed live: an `ota_start` attempt
+    // got an immediate connection reset while the desktop app was
+    // connected). Room for several concurrent clients here costs nothing
+    // real and avoids that entirely for the common case.
+    constexpr uint8_t kMaxWifiTcpClients = 6;
 
     // Templated over EthernetClient/WiFiClient (both expose the same
     // available()/read()/write()/connected() shape in the Arduino core, no
@@ -1760,16 +1841,44 @@ namespace
         // Must fit an ota_chunk line: a 2048-byte chunk hex-encodes to
         // 4096 chars, plus ~60 bytes of JSON overhead - see
         // handle_ota_chunk_command()'s own comment on why this TCP path
-        // isn't stuck at ESP-NOW's 220-byte/640-line sizing.
+        // isn't stuck at ESP-NOW's 220-byte/640-line sizing. Comfortably
+        // covers a plain HTTP request line too (this server never reads
+        // past that single line - see service_tcp_client()'s own
+        // comment on why the rest of a browser's headers are simply
+        // left unread).
         char lineBuf[4300];
         size_t lineLen = 0;
-        void reset() { lineLen = 0; }
+        // Set when the slot is first accepted into, read by
+        // service_tcp_client()'s own idle-timeout check below - only
+        // matters before protocolKnown is true (see that field's own
+        // comment); an HTTP request either completes and closes well
+        // within kHttpClientTimeoutMs or it's stuck/malformed and this
+        // is exactly the client worth timing out.
+        uint32_t clientStartMs = 0;
+        // True once this connection has sent at least one full JSON or
+        // legacy-text-command line (see service_tcp_client()'s own
+        // dispatch) - i.e. it's a genuine persistent session (the
+        // desktop app, or a scripted OTA tool), not a one-shot HTTP
+        // request (which never sets this - it dispatches and closes
+        // within the same call). Gates the idle-timeout check below:
+        // without this, an established, perfectly healthy persistent
+        // session sitting idle between commands (lineLen==0 is the
+        // NORMAL state between messages, not a sign of trouble) would
+        // get force-closed the moment it happened to be idle for
+        // longer than kHttpClientTimeoutMs - the JSON protocol never had
+        // any such timeout before this merge, and still shouldn't.
+        bool protocolKnown = false;
+        void reset()
+        {
+            lineLen = 0;
+            protocolKnown = false;
+        }
     };
-    EthernetServer s_tcp_server(kGatewayTcpPort);
+    EthernetServer s_tcp_server(kHttpPort);
     TcpClientState<EthernetClient> s_tcp_clients[kMaxEthTcpClients];
     bool s_tcp_server_started = false;
 
-    WiFiServer s_wifi_tcp_server(kGatewayTcpPort);
+    WiFiServer s_wifi_tcp_server(kHttpPort);
     TcpClientState<WiFiClient> s_wifi_tcp_clients[kMaxWifiTcpClients];
     bool s_wifi_tcp_server_started = false;
 
@@ -1785,6 +1894,19 @@ namespace
     // mid-dispatch - correctly means "no TCP client to spare" if an OTA
     // starts from the ESP-NOW entry point instead (see that comment).
     void *s_currentTcpClientTag = nullptr;
+
+    // Forward-declared (defined with the rest of the HTML status site,
+    // much further down this file) - same reasoning as broadcast_line_
+    // to_tcp_clients's own forward declaration near the top of this file:
+    // service_tcp_client() below needs to call these well before their
+    // own definitions. extract_http_request()/dispatch_http_request()
+    // used to belong to a completely separate HTTP-only server
+    // (service_http_client()) - see kHttpPort's own comment for why
+    // that's no longer a separate thing at all.
+    void extract_http_request(const char *requestLine, char *outPath, size_t outPathSize, char *outQuery,
+                              size_t outQuerySize);
+    template <typename ClientT>
+    void dispatch_http_request(ClientT &client, const char *path, const char *query);
 
     template <typename ClientT>
     void service_tcp_client(TcpClientState<ClientT> &st)
@@ -1802,6 +1924,33 @@ namespace
                     char *trimmed = st.lineBuf;
                     while (*trimmed == ' ' || *trimmed == '\t')
                         trimmed++;
+                    // A real HTTP request always starts with a method
+                    // keyword - this server only ever answers GET (see
+                    // dispatch_http_request()'s own callers - nothing here
+                    // implements POST/PUT/etc.), so that's the one prefix
+                    // to check for. One-shot: dispatch, respond, close -
+                    // deliberately never reads past this single request
+                    // line (the rest of a real browser's headers are just
+                    // left unread in the socket buffer, discarded when
+                    // stop() tears the connection down) - this server has
+                    // never needed anything a header would carry.
+                    if (strncmp(trimmed, "GET ", 4) == 0)
+                    {
+                        char path[32];
+                        char query[64];
+                        extract_http_request(trimmed, path, sizeof(path), query, sizeof(query));
+                        dispatch_http_request(st.client, path, query);
+                        st.client.stop();
+                        st.reset();
+                        return;
+                    }
+                    // Not HTTP - this project's own JSON or legacy text
+                    // command protocol (see PROTOCOL.md's own line-based
+                    // framing) - a genuine persistent session from here on,
+                    // matches this protocol's original (pre-merge)
+                    // behavior of staying open indefinitely between
+                    // commands rather than closing after just one.
+                    st.protocolKnown = true;
                     s_currentTcpClientTag = static_cast<void *>(&st);
                     if (*trimmed == '{')
                         handle_json_line(trimmed);
@@ -1816,6 +1965,18 @@ namespace
                 st.lineBuf[st.lineLen++] = c;
             // else: line too long - silently drop the overflow byte rather
             // than corrupt framing, same policy as service_serial().
+        }
+
+        // Only while the protocol is still undetermined (see
+        // TcpClientState::protocolKnown's own comment) - an HTTP request
+        // either completes and closes well within kHttpClientTimeoutMs or
+        // is stuck/malformed (worth timing out); an established JSON/text
+        // session sitting idle between commands is normal and must never
+        // be force-closed just for being quiet for a while.
+        if (!st.protocolKnown && millis() - st.clientStartMs > kHttpClientTimeoutMs)
+        {
+            st.client.stop();
+            st.reset();
         }
     }
 
@@ -1854,12 +2015,13 @@ namespace
         {
             server.begin();
             serverStarted = true;
-            Serial.printf("TCP JSON server (%s) listening on port %u\n", transportLabel, kGatewayTcpPort);
+            Serial.printf("Shared HTTP/JSON listener (%s) listening on port %u\n", transportLabel, kHttpPort);
         }
         // Keeps accepting into every free slot, not just the first one -
-        // see poll_http_listener()'s own comment for why a single
-        // accept() per call silently lost every simultaneous connection
-        // past the first, even with several slots configured.
+        // a single accept() per call silently lost every simultaneous
+        // connection past the first, even with several slots configured
+        // (confirmed live, back when this pool was HTTP-only: a browser's
+        // document + logo + immediate AJAX fetch all landing at once).
         bool anyFree = false;
         for (uint8_t i = 0; i < clientCount; i++)
         {
@@ -1871,6 +2033,7 @@ namespace
                     break;
                 clients[i].client = incoming;
                 clients[i].reset();
+                clients[i].clientStartMs = millis();
                 Serial.printf("TCP client connected (%s).\n", transportLabel);
             }
         }
@@ -1884,6 +2047,7 @@ namespace
                 clients[0].client.stop();
                 clients[0].client = incoming;
                 clients[0].reset();
+                clients[0].clientStartMs = millis();
             }
         }
 
@@ -1975,65 +2139,515 @@ namespace
         // than one dispatching on s_eth_connected/s_wifi_connected so a
         // client that's mid-disconnect during the transport decision's
         // own transition doesn't miss an event either way.
+        //
+        // protocolKnown is required (not just client.connected()) now
+        // that this pool is shared with one-shot HTTP requests (see
+        // kHttpPort's own comment) - without it, an unsolicited event
+        // firing while some OTHER slot is mid-HTTP-request (accepted,
+        // still buffering its request line, protocolKnown still false)
+        // would write these bytes onto that socket ahead of its eventual
+        // real HTTP response, corrupting it from the browser's point of
+        // view. A genuine JSON/text session always has protocolKnown
+        // true by the time it's sitting connected between commands (see
+        // that field's own comment), so this excludes nothing it
+        // shouldn't.
         for (uint8_t i = 0; i < kMaxEthTcpClients; i++)
-            if (s_tcp_clients[i].client && s_tcp_clients[i].client.connected())
+            if (s_tcp_clients[i].client && s_tcp_clients[i].client.connected() && s_tcp_clients[i].protocolKnown)
                 write_line_to_tcp_client(s_tcp_clients[i].client, line);
         for (uint8_t i = 0; i < kMaxWifiTcpClients; i++)
-            if (s_wifi_tcp_clients[i].client && s_wifi_tcp_clients[i].client.connected())
+            if (s_wifi_tcp_clients[i].client && s_wifi_tcp_clients[i].client.connected() &&
+                s_wifi_tcp_clients[i].protocolKnown)
                 write_line_to_tcp_client(s_wifi_tcp_clients[i].client, line);
     }
 #endif
 
+    // Auto-detects the setting's value type from its typed-in text form:
+    // "true"/"false" -> bool, a clean integer -> int32, a clean float ->
+    // float32, anything else -> string. A human-typed (or URL query-string)
+    // convenience, not part of the wire protocol itself (RTSNOW_SettingPayload
+    // just carries whatever type is decided here). The JSON interface skips
+    // this guesswork entirely - see handle_setting_command's explicit
+    // `valueType`. Shared by both the text interface's cmd_setting (below,
+    // built for every board) and the POE board's HTTP GET /api/setting
+    // endpoint (write_http_setting_response) - hence living in common code
+    // rather than inside either board's own #if block.
+    bool build_setting_payload_from_string(const char *key, const char *value, RTSNOW_SettingPayload &payload,
+                                            const char **error)
+    {
+        if (strlen(key) >= sizeof(payload.key))
+        {
+            *error = "key too long";
+            return false;
+        }
+
+        payload = RTSNOW_SettingPayload{};
+        strncpy(payload.key, key, sizeof(payload.key) - 1);
+
+        char *end = nullptr;
+        long asInt = strtol(value, &end, 10);
+        bool isInt = (end != value && *end == '\0');
+        float asFloat = strtof(value, &end);
+        bool isFloat = (end != value && *end == '\0');
+
+        if (strcmp(value, "true") == 0 || strcmp(value, "false") == 0)
+        {
+            payload.valueType = RTSNOW_SETTING_BOOL;
+            payload.boolValue = (strcmp(value, "true") == 0);
+        }
+        else if (isInt)
+        {
+            payload.valueType = RTSNOW_SETTING_INT32;
+            payload.intValue = static_cast<int32_t>(asInt);
+        }
+        else if (isFloat)
+        {
+            payload.valueType = RTSNOW_SETTING_FLOAT32;
+            payload.floatValue = asFloat;
+        }
+        else
+        {
+            if (strlen(value) >= sizeof(payload.stringValue))
+            {
+                *error = "string value too long";
+                return false;
+            }
+            payload.valueType = RTSNOW_SETTING_STRING;
+            strncpy(payload.stringValue, value, sizeof(payload.stringValue) - 1);
+        }
+        return true;
+    }
+
 #if defined(BOARD_GATEWAY_ATOMS3_POE)
-    // ---- HTML status page (port 80) - separate from the JSON protocol
-    // server above (port 5055, for the desktop app); this one's for a
-    // human with a browser. Structurally a port of RTSNow-SPI-CCP's own
-    // PoeStatusServer.cpp (same board, same dual-transport situation,
-    // proven design) - adapted here to show gateway state (known devices,
-    // ESP-NOW channel) instead of dryer registers. No embedded logo image
-    // (that'd mean duplicating rts_gif/rtslogo.h across repos for a
-    // cosmetic-only page) - plain text/table content only.
-    constexpr uint16_t kHttpPort = 80;
-    constexpr uint32_t kHttpClientTimeoutMs = 3000;
-    // A real browser opens several simultaneous connections for one page
-    // load - the document itself, the logo image, and the page's own
-    // script firing its first fetch('/api/status') immediately - not one
-    // at a time. This used to be a single non-array slot per transport
-    // (mirroring an early mistake already fixed once for the JSON
-    // protocol server - see kMaxEthTcpClients/kMaxWifiTcpClients's own
-    // comments), so only the FIRST of those concurrent requests ever got
-    // served; the rest got an outright connection refusal, silently
-    // swallowed by the page's own fetch().catch(){} - symptom looked
-    // exactly like "the page only updates on the 5s timer, not
-    // immediately on load", confirmed live via a concurrent-request test
-    // (3 of 4 simultaneous requests refused outright with just 1 slot).
-    constexpr uint8_t kMaxEthHttpClients = 3;
-    constexpr uint8_t kMaxWifiHttpClients = 4;  // no hardware ceiling on WiFi - see kMaxWifiTcpClients's own comment
+    // ---- Modbus TCP bridge (port 502) ----
+    //
+    // Answers a standard Modbus TCP master's read-holding/input-registers
+    // request (function code 3 or 4) by looking up which RTS-NOW mesh
+    // device a given Modbus unit ID (slave ID) is mapped to (see
+    // ModbusRoute below - a persisted, user-editable table, much like a
+    // Digi Connect gateway's own "Message Destinations" routing table),
+    // then serving whatever register values that device last reported
+    // over the mesh (KnownDevice::lastRegisters - see its own comment).
+    // Deliberately answers from that cache rather than doing a live
+    // RTSNOW_REQUEST_REGISTERS round-trip per poll: a real Modbus master
+    // (PLC, SCADA/HMI software) typically times out well under a second,
+    // and an ESP-NOW mesh round-trip - especially through a relay, or to
+    // a weak-link node like Dryer SHED, which can need 2-3 attempts even
+    // for a routine OTA chunk - can easily take longer than that. Every
+    // node already broadcasts its own full register block roughly every
+    // 10s regardless of IP (piggybacked on its heartbeat) purely for this
+    // kind of purpose, so the cache is rarely more than a few seconds
+    // stale in practice. Read-only for now (function codes 3/4 only) -
+    // writing through an arbitrary external Modbus master to something
+    // like a dryer's start/stop register is a meaningfully bigger safety
+    // surface, left for a later pass.
+    //
+    // Register addressing: a Modbus request's start address is 0-based
+    // per the spec (register "40011" on the wire is protocol address 10,
+    // the "4xxxx" prefix being a human convention stripped before
+    // transmission) - and that is already exactly how RTSNOW_RegisterBlock
+    // itself is filled (see e.g. RTSNow-SPI-CCP's fillRegisterBlock():
+    // outBlock.values[i] = Registers.get(i), the same 0-based index its
+    // own internal Modbus TCP server would expose at protocol address i).
+    // So no extra offset arithmetic happens here at all - an incoming
+    // request's start address is used as a direct index into
+    // lastRegisters.values.
+
+    struct ModbusRoute
+    {
+        uint8_t slaveId = 0;  // Modbus unit ID, 1-247 when inUse
+        uint8_t mac[6] = {0};
+        bool inUse = false;
+    };
+    constexpr int kMaxModbusRoutes = 16;
+    ModbusRoute s_modbus_routes[kMaxModbusRoutes];
+
+    constexpr const char *kModbusRoutesKey = "mbroutes";
+
+    void save_modbus_routes()
+    {
+        Preferences prefs;
+        prefs.begin(kPrefsNamespace, /*readOnly=*/false);
+        prefs.putBytes(kModbusRoutesKey, s_modbus_routes, sizeof(s_modbus_routes));
+        prefs.end();
+    }
+
+    // Called once from setup() - an old NVS blob from before this table
+    // existed (or of a different size, e.g. after kMaxModbusRoutes
+    // changes) fails getBytes()'s own length check rather than partially
+    // populating the array, so this always starts from a clean, all-
+    // unused table in that case instead of trusting stale/mismatched bytes.
+    void load_modbus_routes()
+    {
+        Preferences prefs;
+        prefs.begin(kPrefsNamespace, /*readOnly=*/true);
+        size_t got = prefs.getBytes(kModbusRoutesKey, s_modbus_routes, sizeof(s_modbus_routes));
+        prefs.end();
+        if (got != sizeof(s_modbus_routes))
+        {
+            for (int i = 0; i < kMaxModbusRoutes; i++)
+                s_modbus_routes[i] = ModbusRoute{};
+        }
+    }
+
+    int find_modbus_route_by_slave_id(uint8_t slaveId)
+    {
+        for (int i = 0; i < kMaxModbusRoutes; i++)
+            if (s_modbus_routes[i].inUse && s_modbus_routes[i].slaveId == slaveId)
+                return i;
+        return -1;
+    }
+
+    bool modbus_route_mac_in_use(const uint8_t mac[6])
+    {
+        for (int i = 0; i < kMaxModbusRoutes; i++)
+            if (s_modbus_routes[i].inUse && memcmp(s_modbus_routes[i].mac, mac, 6) == 0)
+                return true;
+        return false;
+    }
+
+    const char *add_modbus_route(uint8_t slaveId, const uint8_t mac[6])
+    {
+        if (slaveId < 1 || slaveId > 247)
+            return "slaveId must be 1-247";
+        if (find_modbus_route_by_slave_id(slaveId) >= 0)
+            return "slaveId already mapped - remove it first";
+        if (modbus_route_mac_in_use(mac))
+            return "that device is already mapped to a different slaveId";
+        int freeSlot = -1;
+        for (int i = 0; i < kMaxModbusRoutes; i++)
+        {
+            if (!s_modbus_routes[i].inUse)
+            {
+                freeSlot = i;
+                break;
+            }
+        }
+        if (freeSlot < 0)
+            return "routing table is full";
+        s_modbus_routes[freeSlot].slaveId = slaveId;
+        memcpy(s_modbus_routes[freeSlot].mac, mac, 6);
+        s_modbus_routes[freeSlot].inUse = true;
+        save_modbus_routes();
+        return nullptr;
+    }
+
+    bool remove_modbus_route(uint8_t slaveId)
+    {
+        int idx = find_modbus_route_by_slave_id(slaveId);
+        if (idx < 0)
+            return false;
+        s_modbus_routes[idx] = ModbusRoute{};
+        save_modbus_routes();
+        return true;
+    }
+
+    constexpr uint16_t kModbusPort = 502;
+    // 260 bytes comfortably covers the largest possible Modbus TCP ADU
+    // (7-byte MBAP header + up to 253 bytes of PDU - the spec's own cap).
+    constexpr size_t kModbusBufSize = 260;
+    // Full Ethernet budget across the W5500's fixed 8 hardware sockets:
+    // shared HTTP/JSON listener(1)+clients(3)=4 (kMaxEthTcpClients, see
+    // kHttpPort's own comment for why the JSON protocol and the HTML
+    // status site share one pool now), Modbus listener(1)+clients(3)=4
+    // here = 8 of 8. No mDNS UDP socket anymore (see setup()'s own
+    // comment on why it was dropped entirely) and no reserved DHCP-
+    // renewal spare either - confirmed by reading M5_Ethernet's own
+    // Dhcp.cpp that its _dhcpUdpSocket is .stop()'d both before and after
+    // every use, and EthernetClass::maintain() only ever touches it
+    // during a real lease renewal (every few hours, per normal DHCP
+    // timing), not on every 1s maintain() tick - a transient, rare,
+    // self-retrying need is a much softer thing to compete for a socket
+    // than a client this bridge actually needs continuously.
+    //
+    // Been 1, 2, then 3 - each bump driven by a real device count: the
+    // Modbus client (a "Digi Connect"-style tool, using its own
+    // persistent "Maintain Connection" mode per device rather than
+    // reconnecting per-poll) grew from 1 to 3 simultaneous mapped
+    // devices (Dryer Office, Dryer Shed, PolymerPak Solar) over the
+    // course of this session, each needing its own held-open connection.
+    // 3 finally became affordable without shrinking the old HTTP-only
+    // client budget again by removing the *cause* of that pressure
+    // instead: the status page's logo used to be a separate
+    // <img src="/logo.gif"> request competing for an HTTP slot on every
+    // page load - now inlined as a data: URI directly into the page's
+    // own HTML (see rtslogo.h's rts_gif_base64), so that request doesn't
+    // exist anymore at all; and the JSON+HTTP port merge itself (see
+    // kHttpPort's own comment) freed up the rest by no longer needing two
+    // separate listener sockets.
+    constexpr uint8_t kMaxEthModbusClients = 3;
+    constexpr uint8_t kMaxWifiModbusClients = 3;
+    // The compile-time guard for this budget (a static_assert covering
+    // this constant and kMaxEthTcpClients together) lives right after
+    // kMaxEthTcpClients's own definition further down in this file -
+    // that's the last of the two to be declared, and C++ needs both
+    // already in scope before the assertion can reference them.
 
     template <typename ClientT>
-    struct HttpListenerState
+    struct ModbusClientState
     {
         ClientT client;
-        char requestLine[160] = {0};
-        size_t requestLineLen = 0;
-        bool requestLineDone = false;
-        uint32_t clientStartMs = 0;
-        void reset()
-        {
-            requestLineLen = 0;
-            requestLineDone = false;
-        }
+        uint8_t buf[kModbusBufSize];
+        size_t len = 0;
+        // Which mapped slaveId this connection's most recent request
+        // targeted - purely informational, for the Connections Management
+        // page's own "Connected To" column (see write_http_connections_
+        // json()) - 0 (not a valid Modbus unit ID) means "no request
+        // serviced on this connection yet". Deliberately NOT cleared by
+        // reset() - a connection between requests should still show what
+        // it was last talking to, not blank out every time its buffer
+        // empties.
+        uint8_t lastSlaveId = 0;
+        void reset() { len = 0; }
     };
 
-    EthernetServer s_http_eth_server(kHttpPort);
-    WiFiServer s_http_wifi_server(kHttpPort);
-    HttpListenerState<EthernetClient> s_http_eth_states[kMaxEthHttpClients];
-    HttpListenerState<WiFiClient> s_http_wifi_states[kMaxWifiHttpClients];
+    EthernetServer s_modbus_eth_server(kModbusPort);
+    WiFiServer s_modbus_wifi_server(kModbusPort);
+    ModbusClientState<EthernetClient> s_modbus_eth_states[kMaxEthModbusClients];
+    ModbusClientState<WiFiClient> s_modbus_wifi_states[kMaxWifiModbusClients];
+    bool s_modbus_eth_server_started = false;
+    bool s_modbus_wifi_server_started = false;
+
+    // Exception codes actually used here - see the Modbus Application
+    // Protocol Specification's section 7 for the full list; only these
+    // five apply to a read-only gateway bridge. The two "gateway"
+    // exceptions exist in the spec specifically for a device like this
+    // one, bridging Modbus TCP to some other network: 0x0A when this
+    // slave ID has nowhere configured to go at all, 0x0B when it does but
+    // that target hasn't ever actually reported in (mapped, but
+    // unreachable/no data yet).
+    constexpr uint8_t kModbusExIllegalFunction = 0x01;
+    constexpr uint8_t kModbusExIllegalDataAddress = 0x02;
+    constexpr uint8_t kModbusExGatewayPathUnavailable = 0x0A;
+    constexpr uint8_t kModbusExGatewayTargetFailedToRespond = 0x0B;
+
+    template <typename ClientT>
+    void write_modbus_exception(ClientT &client, uint16_t transactionId, uint8_t unitId, uint8_t functionCode,
+                                 uint8_t exceptionCode)
+    {
+        uint8_t resp[9];
+        resp[0] = static_cast<uint8_t>(transactionId >> 8);
+        resp[1] = static_cast<uint8_t>(transactionId & 0xFF);
+        resp[2] = 0;  // protocol ID hi
+        resp[3] = 0;  // protocol ID lo
+        resp[4] = 0;  // length hi
+        resp[5] = 3;  // length lo - unitId + functionCode|0x80 + exceptionCode
+        resp[6] = unitId;
+        resp[7] = static_cast<uint8_t>(functionCode | 0x80);
+        resp[8] = exceptionCode;
+        client.write(resp, sizeof(resp));
+    }
+
+    template <typename ClientT>
+    void handle_modbus_request(ClientT &client, const uint8_t *adu, size_t aduLen)
+    {
+        // adu[0..1] transactionId, [2..3] protocolId, [4..5] length,
+        // [6] unitId, [7] functionCode, [8..] function-specific data.
+        uint16_t transactionId = (static_cast<uint16_t>(adu[0]) << 8) | adu[1];
+        uint8_t unitId = adu[6];
+        uint8_t functionCode = adu[7];
+
+        int routeIdx = find_modbus_route_by_slave_id(unitId);
+        if (routeIdx < 0)
+        {
+            write_modbus_exception(client, transactionId, unitId, functionCode, kModbusExGatewayPathUnavailable);
+            return;
+        }
+        int knownIdx = find_known_device_by_mac(s_modbus_routes[routeIdx].mac);
+        if (knownIdx < 0 || !s_known_devices[knownIdx].hasRegisters)
+        {
+            write_modbus_exception(client, transactionId, unitId, functionCode,
+                                    kModbusExGatewayTargetFailedToRespond);
+            return;
+        }
+        if (functionCode != 0x03 && functionCode != 0x04)
+        {
+            write_modbus_exception(client, transactionId, unitId, functionCode, kModbusExIllegalFunction);
+            return;
+        }
+        if (aduLen < 12)
+        {
+            write_modbus_exception(client, transactionId, unitId, functionCode, kModbusExIllegalDataAddress);
+            return;
+        }
+        uint16_t startAddress = (static_cast<uint16_t>(adu[8]) << 8) | adu[9];
+        uint16_t quantity = (static_cast<uint16_t>(adu[10]) << 8) | adu[11];
+        const RTSNOW_RegisterBlock &block = s_known_devices[knownIdx].lastRegisters;
+        // 125 is the standard's own per-request cap for FC3/4 (253-byte
+        // max PDU / 2 bytes per register, minus the 2-byte header).
+        if (quantity < 1 || quantity > 125 ||
+            static_cast<uint32_t>(startAddress) + quantity > block.registerCount)
+        {
+            write_modbus_exception(client, transactionId, unitId, functionCode, kModbusExIllegalDataAddress);
+            return;
+        }
+
+        uint8_t resp[9 + 125 * 2];
+        uint8_t byteCount = static_cast<uint8_t>(quantity * 2);
+        uint16_t length = 3 + byteCount;  // unitId + functionCode + byteCount + data
+        resp[0] = static_cast<uint8_t>(transactionId >> 8);
+        resp[1] = static_cast<uint8_t>(transactionId & 0xFF);
+        resp[2] = 0;
+        resp[3] = 0;
+        resp[4] = static_cast<uint8_t>(length >> 8);
+        resp[5] = static_cast<uint8_t>(length & 0xFF);
+        resp[6] = unitId;
+        resp[7] = functionCode;
+        resp[8] = byteCount;
+        for (uint16_t i = 0; i < quantity; i++)
+        {
+            uint16_t value = block.values[startAddress + i];
+            resp[9 + i * 2] = static_cast<uint8_t>(value >> 8);
+            resp[9 + i * 2 + 1] = static_cast<uint8_t>(value & 0xFF);
+        }
+        client.write(resp, static_cast<size_t>(9 + byteCount));
+    }
+
+    template <typename ClientT>
+    void service_modbus_client(ModbusClientState<ClientT> &st)
+    {
+        while (st.client.available())
+        {
+            if (st.len >= sizeof(st.buf))
+            {
+                // Something is very wrong (garbage, or a non-Modbus
+                // client) - drop the connection rather than loop forever
+                // discarding bytes with no way to ever resynchronize.
+                st.client.stop();
+                st.reset();
+                return;
+            }
+            st.buf[st.len++] = static_cast<uint8_t>(st.client.read());
+
+            if (st.len < 6)
+                continue;  // still waiting for the rest of the MBAP length field
+
+            uint16_t declaredLen = (static_cast<uint16_t>(st.buf[4]) << 8) | st.buf[5];
+            // declaredLen counts unitId+PDU only, not the transactionId/
+            // protocolId/length fields themselves (6 bytes) that precede it.
+            if (declaredLen == 0 || declaredLen > sizeof(st.buf) - 6)
+            {
+                st.client.stop();  // not a well-formed Modbus TCP frame
+                st.reset();
+                return;
+            }
+            size_t totalLen = 6 + declaredLen;
+            if (st.len < totalLen)
+                continue;  // full ADU not buffered yet
+
+            st.lastSlaveId = st.buf[6];  // MBAP's unitId byte - see ModbusClientState::lastSlaveId's own comment
+            handle_modbus_request(st.client, st.buf, totalLen);
+            st.reset();
+        }
+    }
+
+    template <typename ServerT, typename ClientT>
+    void poll_modbus_clients(ServerT &server, ModbusClientState<ClientT> *clients, uint8_t clientCount,
+                              bool &serverStarted, const char *transportLabel)
+    {
+        if (!serverStarted)
+        {
+            server.begin();
+            serverStarted = true;
+            Serial.printf("Modbus TCP bridge (%s) listening on port %u\n", transportLabel, kModbusPort);
+        }
+        // Same multi-slot accept-into-every-free-slot-then-evict-oldest
+        // policy as poll_tcp_clients() - see its own comment for why a
+        // single accept() per call silently loses every additional
+        // simultaneous connection.
+        bool anyFree = false;
+        for (uint8_t i = 0; i < clientCount; i++)
+        {
+            if (!clients[i].client || !clients[i].client.connected())
+            {
+                anyFree = true;
+                ClientT incoming = server.accept();
+                if (!incoming)
+                    break;
+                clients[i].client = incoming;
+                clients[i].reset();
+            }
+        }
+        if (!anyFree)
+        {
+            ClientT incoming = server.accept();
+            if (incoming)
+            {
+                clients[0].client.stop();
+                clients[0].client = incoming;
+                clients[0].reset();
+            }
+        }
+
+        for (uint8_t i = 0; i < clientCount; i++)
+            if (clients[i].client && clients[i].client.connected())
+                service_modbus_client(clients[i]);
+    }
+
+    void poll_modbus_server()
+    {
+        if (s_eth_connected)
+            poll_modbus_clients(s_modbus_eth_server, s_modbus_eth_states, kMaxEthModbusClients,
+                                 s_modbus_eth_server_started, "Ethernet");
+        else if (s_wifi_connected)
+            poll_modbus_clients(s_modbus_wifi_server, s_modbus_wifi_states, kMaxWifiModbusClients,
+                                 s_modbus_wifi_server_started, "WiFi");
+    }
+
+    // ---- HTML status page (port 80, shared with the JSON protocol
+    // server above - see below) - this one's for a human with a browser,
+    // the JSON protocol above is for the desktop app. Structurally a port
+    // of RTSNow-SPI-CCP's own
+    // PoeStatusServer.cpp (same board, same dual-transport situation,
+    // proven design) - adapted here to show gateway state (known devices,
+    // ESP-NOW channel) instead of dryer registers. Does now embed the
+    // logo (rts_gif/rtslogo.h, copied into this repo the same way that
+    // sibling one is, rather than a cross-repo reference) - inlined as a
+    // data: URI straight into this page's own HTML (see write_http_page_
+    // head()'s own comment) rather than served as its own /logo.gif
+    // endpoint, specifically so it can never again compete with anything
+    // else for one of this transport's scarce HTTP client sockets.
+    //
+    // This whole HTML site is now served off the SAME port/listener/
+    // client pool as the JSON protocol server (see kHttpPort's own
+    // definition and TcpClientState's own comment for why) - no separate
+    // kHttpPort-bound EthernetServer/WiFiServer, client-state struct, or
+    // socket budget of its own exists anymore; it shares kMaxEthTcpClients/
+    // kMaxWifiTcpClients (see those constants' own comment for the current
+    // combined accounting) and kHttpClientTimeoutMs (moved up near
+    // kHttpPort for the same reason).
+    //
+    // A real browser used to open several simultaneous connections for
+    // one page load - the document itself, the logo image, and the
+    // page's own script firing its first fetch('/api/status')
+    // immediately - not one at a time, which is exactly the kind of
+    // pressure that motivated merging this server with the JSON one in
+    // the first place (see kHttpPort's own comment for the full history:
+    // a rigid, separate HTTP-only allocation kept getting fought over
+    // against Modbus's own growing needs, and even after the logo was
+    // inlined to remove one of the three simultaneous requests, plain
+    // page NAVIGATION could still lose the race against a still-in-flight
+    // background fetch('/api/status') from the page just left with only
+    // 1 rigid HTTP slot). A shared pool of kMaxEthTcpClients lets
+    // whichever protocol actually needs more room at any given moment use
+    // it, instead of it sitting reserved-but-idle in the other protocol's
+    // own separate allocation.
+    //
+    // Compile-time guard against exactly the mistake that caused a real
+    // production outage earlier this session: this Ethernet socket
+    // budget being reasoned about in comments with no automatic check is
+    // how a previous version of this split shipped described as "8 of 8"
+    // when it was actually 9. The two "+1"s are each pool's own listener
+    // socket (kMaxEthTcpClients/kMaxEthModbusClients themselves count
+    // clients only, never the listener - always exactly one each).
+    static_assert(kMaxEthTcpClients + 1 + kMaxEthModbusClients + 1 <= 8,
+                  "Ethernet socket budget exceeds the W5500's fixed 8 hardware sockets - see "
+                  "kMaxEthTcpClients's own comment for the full accounting");
 
     // M5_Ethernet's socketSend() silently clamps any single write over
     // ~2KB (the W5500's per-socket TX buffer) while still reporting the
-    // full size as sent - see write_http_logo()'s own comment, which
-    // already worked around this for the logo specifically. write_http_
+    // full size as sent - see write_http_page_head()'s own base64-logo
+    // comment, which works around this the same way (write_http_chunked)
+    // for the inlined logo specifically. write_http_
     // style()/write_http_script() below are each one big println() call
     // built from many adjacent string literals - write_http_script() grew
     // past 2KB over the course of this session without this same
@@ -2091,7 +2705,10 @@ namespace
                        // cleanly at a fixed advance width; a proportional
                        // body font renders them at inconsistent widths.
                        // Matches PoeStatusServer.cpp's own td.rssi rule.
-                       "td.rssi{font-family:monospace;letter-spacing:1px;}"
+                       // Plain class (not td.rssi) since renderDeviceDetails()
+                       // in write_http_script() reuses the same rssiBars()
+                       // output inside a <span>, not a table cell.
+                       ".rssi{font-family:monospace;letter-spacing:1px;}"
                        "#sidebar a.active{font-weight:700;text-decoration:underline;}"
                        "button.reboot-btn{background:#001a70;color:#fff;border:none;border-radius:2px;"
                        "padding:4px 10px;font-size:0.85em;cursor:pointer;}"
@@ -2101,6 +2718,13 @@ namespace
                        // rebootDevice()/refresh()'s own comment for the
                        // exact "back up" heuristic.
                        "tr.rebooting{opacity:0.45;}"
+                       // Only the Known Devices table's rows get this (see
+                       // selectDevice() in write_http_script) - other pages'
+                       // tables have no click behavior, so no cursor hint.
+                       "#devicesBody tr{cursor:pointer;}"
+                       "#devicesBody tr.selected{background:#eef1fb;}"
+                       "#deviceDetails{display:none;}"
+                       "#deviceDetails label{cursor:pointer;}"
                        "</style>");
     }
 
@@ -2180,6 +2804,91 @@ namespace
                        "el('rebootSelfStatus').textContent='Rebooting...';"
                        "fetch('/api/reboot_self').then(function(){},function(){});"
                        "}"
+                       // Known Devices row-selection state. lastDevices is
+                       // the full array from the most recent /api/status
+                       // poll (refresh() rebuilds the whole tbody every
+                       // 5s, so the details panel re-renders from this
+                       // rather than from the DOM). wifiEnabledState is
+                       // purely optimistic client-side UI state, keyed by
+                       // mac - the wire protocol has no way to read a
+                       // node's actual current wifiEnabled setting back
+                       // (RTSNOW_SET_SETTING/do_setting_send is fire-and-
+                       // forget, same as reboot - see do_setting_send's own
+                       // comment), so the checkbox just reflects the last
+                       // value THIS browser tab itself sent - undefined
+                       // (not yet toggled this session) falls back to
+                       // whether the device currently has an IP at all
+                       // (see renderDeviceDetails()'s own comment) rather
+                       // than blindly defaulting to checked - confirmed
+                       // live that blindly defaulting true was actively
+                       // misleading for a node that's genuinely mesh-only
+                       // right now (SHED, no IP - checkbox showed checked
+                       // regardless).
+                       "var selectedMac=null,lastDevices=[],wifiEnabledState={};"
+                       "function selectDevice(mac){selectedMac=(selectedMac===mac?null:mac);renderDeviceDetails();}"
+                       "function toggleWifi(mac,enabled){"
+                       "wifiEnabledState[mac]=enabled;"
+                       "var st=el('wifiEnabledStatus');"
+                       "if(st)st.textContent='Sending...';"
+                       "fetch('/api/setting?mac='+mac+'&key=wifiEnabled&value='+(enabled?'true':'false'))"
+                       ".then(function(r){return r.json();})"
+                       ".then(function(j){if(st)st.textContent=j.ok?'Sent':('Error: '+(j.error||'failed'));})"
+                       ".catch(function(){if(st)st.textContent='Error: request failed';});"
+                       "}"
+                       "function renderDeviceDetails(){"
+                       "var box=el('deviceDetails'),body=el('deviceDetailsBody');"
+                       "if(!box||!body)return;"
+                       "var dev=null;"
+                       "for(var i=0;i<lastDevices.length;i++)if(lastDevices[i].mac===selectedMac){dev=lastDevices[i];break;}"
+                       "if(!dev){box.style.display='none';return;}"
+                       "box.style.display='block';"
+                       // No IP at all is a real, already-visible signal
+                       // this node's WiFi is very likely off/disconnected
+                       // right now (it's exactly what "mesh-only" means
+                       // elsewhere on this same page) - a far more honest
+                       // default than always assuming enabled, though
+                       // still just a heuristic (a node with WiFi
+                       // genuinely enabled but its AP temporarily out of
+                       // range would look the same). Once THIS tab
+                       // explicitly toggles it, that becomes authoritative
+                       // for the rest of the session regardless of IP.
+                       "var enabled=(wifiEnabledState[dev.mac]!==undefined)?wifiEnabledState[dev.mac]:!!dev.ip;"
+                       "body.innerHTML="
+                       "'<p><b>'+dev.name+'</b> ('+deviceTypeLabel(dev.type)+', '+dev.project+')</p>'+"
+                       "'<p>MAC: '+dev.mac+'</p>'+"
+                       "'<p>IP: '+(dev.ip||'-')+'</p>'+"
+                       "'<p>Mesh: <span class=\"rssi\">'+rssiBars(dev.meshRssi)+'</span></p>'+"
+                       "'<p>Last heard: '+dev.ago+'s ago</p>'+"
+                       "'<p><label><input type=\"checkbox\" id=\"wifiEnabledCb\" '+(enabled?'checked':'')+"
+                       "' onchange=\"toggleWifi(\\''+dev.mac+'\\',this.checked)\"> Enable WiFi</label> '+"
+                       "'<span id=\"wifiEnabledStatus\"></span></p>';"
+                       "}"
+                       // Modbus TCP bridge (/modbus page) - add/remove
+                       // routing table entries via the API endpoints
+                       // write_http_modbus_route_add_response()/
+                       // write_http_modbus_route_remove_response() wrap.
+                       "function removeModbusRoute(slaveId){"
+                       "fetch('/api/modbus_route_remove?slaveId='+slaveId).then(refresh).catch(function(){});"
+                       "}"
+                       "function addModbusRoute(){"
+                       "var slaveId=el('modbusSlaveIdInput').value;"
+                       "var mac=el('modbusDeviceSelect').value;"
+                       "var st=el('modbusAddStatus');"
+                       "if(!slaveId||!mac){st.textContent='Pick a Slave ID and a device first.';return;}"
+                       "st.textContent='Adding...';"
+                       "fetch('/api/modbus_route_add?slaveId='+slaveId+'&mac='+mac)"
+                       ".then(function(r){return r.json();})"
+                       ".then(function(j){st.textContent=j.ok?'Added':('Error: '+(j.error||'failed'));if(j.ok)refresh();})"
+                       ".catch(function(){st.textContent='Error: request failed';});"
+                       "}"
+                       // Connections Management (/connections page) -
+                       // (listener,index) is exactly what each row's own
+                       // /api/status "connections" entry reported itself
+                       // under (see write_connection_json_entry()), so no
+                       // separate lookup is needed here.
+                       "function disconnectConnection(listener,index){"
+                       "fetch('/api/connection_disconnect?listener='+listener+'&index='+index).then(refresh).catch(function(){});"
+                       "}"
                        "function refresh(){"
                        "fetch('/api/status').then(function(r){return r.json();}).then(function(d){"
                        "if(el('uptime'))el('uptime').textContent=formatUptime(d.uptime);"
@@ -2193,6 +2902,7 @@ namespace
                        "el('netDetails').innerHTML=net;"
                        "}"
                        "if(el('devicesBody')){"
+                       "lastDevices=d.devices;"
                        "var rows='';"
                        "if(d.devices.length===0)rows='<tr><td colspan=\"8\">No devices heard yet</td></tr>';"
                        "d.devices.forEach(function(p){"
@@ -2202,12 +2912,47 @@ namespace
                        "if(p.ago<elapsed)delete reboots[p.mac];"
                        "else rebooting=true;"
                        "}"
-                       "rows+='<tr class=\"'+(rebooting?'rebooting':'')+'\"><td>'+p.name+'</td><td>'+p.project+'</td><td>'+"
+                       "var cls=(rebooting?'rebooting ':'')+(p.mac===selectedMac?'selected':'');"
+                       "rows+='<tr class=\"'+cls+'\" onclick=\"selectDevice(\\''+p.mac+'\\')\"><td>'+p.name+'</td><td>'+p.project+'</td><td>'+"
                        "deviceTypeLabel(p.type)+'</td><td>'+p.mac+'</td><td>'+(p.ip||'-')+'</td><td class=\"rssi\">'+"
                        "rssiBars(p.meshRssi)+'</td><td>'+p.ago+'s ago</td><td><button class=\"reboot-btn\" '+"
-                       "(rebooting?'disabled':'')+' onclick=\"rebootDevice(\\''+p.mac+'\\',this)\">Reboot</button></td></tr>';"
+                       "(rebooting?'disabled':'')+' onclick=\"event.stopPropagation();rebootDevice(\\''+p.mac+'\\',this)\">Reboot</button></td></tr>';"
                        "});"
                        "el('devicesBody').innerHTML=rows;"
+                       "renderDeviceDetails();"
+                       "}"
+                       "if(el('modbusRoutesBody')){"
+                       "var mrows='';"
+                       "if(d.modbusRoutes.length===0)mrows='<tr><td colspan=\"5\">No routes configured</td></tr>';"
+                       "d.modbusRoutes.forEach(function(r){"
+                       "mrows+='<tr><td>'+r.slaveId+'</td><td>'+r.name+'</td><td>'+r.mac+'</td><td>'+"
+                       "(r.hasRegisters?(r.ago+'s ago'):'no data yet')+'</td><td><button class=\"reboot-btn\" '+"
+                       "'onclick=\"removeModbusRoute('+r.slaveId+')\">Remove</button></td></tr>';"
+                       "});"
+                       "el('modbusRoutesBody').innerHTML=mrows;"
+                       // Device dropdown for the Add form only ever offers
+                       // devices NOT already mapped to some slaveId (see
+                       // add_modbus_route()'s own one-slaveId-per-device
+                       // rule) - matches the user-facing ask ("pick a
+                       // device's MAC address not already defined").
+                       "var mappedMacs={};"
+                       "d.modbusRoutes.forEach(function(r){mappedMacs[r.mac]=true;});"
+                       "var sel=el('modbusDeviceSelect');"
+                       "var prevVal=sel.value;"
+                       "var opts='';"
+                       "d.devices.forEach(function(p){if(!mappedMacs[p.mac])opts+='<option value=\"'+p.mac+'\">'+p.name+' ('+p.mac+')</option>';});"
+                       "sel.innerHTML=opts;"
+                       "if(prevVal)sel.value=prevVal;"
+                       "}"
+                       "if(el('connectionsBody')){"
+                       "var crows='';"
+                       "if(d.connections.length===0)crows='<tr><td colspan=\"4\">No active connections</td></tr>';"
+                       "d.connections.forEach(function(c){"
+                       "crows+='<tr><td>'+c.listener.toUpperCase()+'</td><td>'+c.remoteIp+':'+c.remotePort+'</td>'+"
+                       "'<td>'+c.connectedTo+'</td><td><button class=\"reboot-btn\" '+"
+                       "'onclick=\"disconnectConnection(\\''+c.listener+'\\','+c.index+')\">Disconnect</button></td></tr>';"
+                       "});"
+                       "el('connectionsBody').innerHTML=crows;"
                        "}"
                        "}).catch(function(){});"
                        "}"
@@ -2261,13 +3006,27 @@ namespace
                       title);
         write_http_style(client);
         client.println("</head><body>");
-        client.println("<div id=\"topbar\"><img src=\"/logo.gif\" alt=\"RTS\">"
-                       "<h1>RTS-NOW Gateway Status</h1></div>");
+        // Inlined as a data: URI (see rtslogo.h's own rts_gif_base64
+        // comment for why) rather than a separate <img src="/logo.gif">
+        // request - String, not a stack char[], since rts_gif_base64
+        // alone is ~5KB and this also needs the surrounding tag text
+        // concatenated in; written through write_http_chunked() since a
+        // single write() this large would hit the exact same silent
+        // truncation write_http_logo() used to chunk around (see
+        // kHttpWriteChunkSize's own comment).
+        String topbar;
+        topbar.reserve(sizeof(rts_gif_base64) + 96);
+        topbar += "<div id=\"topbar\"><img src=\"data:image/gif;base64,";
+        topbar += rts_gif_base64;
+        topbar += "\" alt=\"RTS\"><h1>RTS-NOW Gateway Status</h1></div>";
+        write_http_chunked(client, topbar.c_str());
         client.println("<div id=\"layout\">");
         client.print("<div id=\"sidebar\">");
         write_http_nav_link(client, "/", "Home", activePage);
         write_http_nav_link(client, "/network", "Network", activePage);
         write_http_nav_link(client, "/devices", "Known Devices", activePage);
+        write_http_nav_link(client, "/modbus", "Modbus Routing", activePage);
+        write_http_nav_link(client, "/connections", "Connections", activePage);
         write_http_nav_link(client, "/system", "System Information", activePage);
         client.println("</div>");
         client.println("<div id=\"main\">");
@@ -2315,6 +3074,51 @@ namespace
         client.println("<table><tr><th>Name</th><th>Project</th><th>Type</th><th>MAC</th><th>IP</th><th>Mesh</th>"
                        "<th>Last heard</th><th>Action</th></tr><tbody id=\"devicesBody\"></tbody></table>");
         client.println("</div></div>");
+        // Populated/shown by selectDevice()/renderDeviceDetails() in
+        // write_http_script - empty and hidden until a row is clicked.
+        client.println("<div class=\"box\" id=\"deviceDetails\"><h2>Device Details</h2>"
+                       "<div class=\"body\" id=\"deviceDetailsBody\"></div></div>");
+        write_http_page_foot(client);
+    }
+
+    template <typename ClientT>
+    void write_http_modbus_page(ClientT &client)
+    {
+        write_http_page_head(client, "RTS-NOW Gateway - Modbus Routing", "/modbus");
+        client.println("<div class=\"box\"><h2>Modbus TCP Routing</h2><div class=\"body\">");
+        client.println("<p>An external Modbus TCP master polling this gateway's own IP on port 502 with a given "
+                       "Slave ID gets routed to whichever mesh device is mapped to it below, reading back that "
+                       "device's most recently reported register values (function codes 3/4, read-only). A device's "
+                       "own register numbering (e.g. RTS-NOW-SPI-CCP's 400xx sheet) still applies here as usual - "
+                       "protocol address 0 is that device's own first register.</p>");
+        client.println("<table><tr><th>Slave ID</th><th>Device</th><th>MAC</th><th>Registers</th><th>Action</th>"
+                       "</tr><tbody id=\"modbusRoutesBody\"></tbody></table>");
+        client.println("</div></div>");
+        client.println("<div class=\"box\"><h2>Add Route</h2><div class=\"body\">"
+                       "<label>Slave ID: <input type=\"number\" id=\"modbusSlaveIdInput\" min=\"1\" max=\"247\" "
+                       "style=\"width:70px;\"></label> "
+                       "<label>Device: <select id=\"modbusDeviceSelect\"></select></label> "
+                       "<button class=\"reboot-btn\" onclick=\"addModbusRoute()\">Add</button> "
+                       "<span id=\"modbusAddStatus\"></span>"
+                       "</div></div>");
+        write_http_page_foot(client);
+    }
+
+    // Modeled after a Digi ConnectPort's own "Connections Management"
+    // page - one row per currently-connected client slot across every
+    // listener on whichever transport is up, with a per-row Disconnect
+    // action. See write_http_status_json()'s own "connections" array for
+    // where this table's data actually comes from.
+    template <typename ClientT>
+    void write_http_connections_page(ClientT &client)
+    {
+        write_http_page_head(client, "RTS-NOW Gateway - Connections", "/connections");
+        client.println("<div class=\"box\"><h2>Connections Management</h2><div class=\"body\">");
+        client.println("<p>Every currently-connected client across this gateway's two listeners (the shared "
+                       "JSON protocol / HTTP status page on port 80, and the Modbus TCP bridge on port 502).</p>");
+        client.println("<table><tr><th>Protocol</th><th>Connected From</th><th>Connected To</th><th>Action</th>"
+                       "</tr><tbody id=\"connectionsBody\"></tbody></table>");
+        client.println("</div></div>");
         write_http_page_foot(client);
     }
 
@@ -2353,31 +3157,63 @@ namespace
         write_http_page_foot(client);
     }
 
-    // Chunk size well under the W5500's per-socket TX buffer - see
-    // PoeStatusServer.cpp's own kLogoChunkSize comment for the exact bug
-    // (M5_Ethernet's socketSend() silently clamping a single large write)
-    // this sidesteps; WiFiClient has no equivalent limit but chunking it
-    // the same way regardless costs nothing and keeps one code path.
-    constexpr size_t kLogoChunkSize = 512;
-
-    template <typename ClientT>
-    void write_http_logo(ClientT &client)
+    // "Slave <n> (Device Name)" if the connection's most recent request
+    // matched a configured Modbus route (see ModbusClientState::
+    // lastSlaveId's own comment), just "Slave <n>" if the slaveId isn't
+    // mapped to anything (a master polling a route that was since
+    // removed, or one that never existed), or "-" if this connection
+    // hasn't serviced any request yet. Only Modbus connections have a
+    // meaningful downstream target at all - HTTP/JSON connections talk to
+    // the gateway itself, not some further device, so those always pass
+    // slaveId 0 here.
+    void modbus_connected_to_label(uint8_t slaveId, char *out, size_t outSize)
     {
-        client.println("HTTP/1.1 200 OK");
-        client.println("Content-Type: image/gif");
-        client.printf("Content-Length: %u\n", rts_gif_len);
-        client.println("Connection: close");
-        client.println();
-        size_t sent = 0;
-        while (sent < rts_gif_len)
+        if (slaveId == 0)
         {
-            size_t remaining = rts_gif_len - sent;
-            size_t chunk = remaining < kLogoChunkSize ? remaining : kLogoChunkSize;
-            size_t written = client.write(rts_gif + sent, chunk);
-            if (written == 0)
-                break;  // client disconnected mid-transfer
-            sent += written;
+            snprintf(out, outSize, "-");
+            return;
         }
+        int routeIdx = find_modbus_route_by_slave_id(slaveId);
+        if (routeIdx < 0)
+        {
+            snprintf(out, outSize, "Slave %u (unmapped)", slaveId);
+            return;
+        }
+        int knownIdx = find_known_device_by_mac(s_modbus_routes[routeIdx].mac);
+        if (knownIdx >= 0)
+            snprintf(out, outSize, "Slave %u (%s)", slaveId, s_known_devices[knownIdx].friendlyName);
+        else
+            snprintf(out, outSize, "Slave %u", slaveId);
+    }
+
+    // One row of the Connections Management page's own table (see
+    // write_http_connections_page()) - respClient is whoever's asking for
+    // this JSON (a browser polling /api/status), connClient is the
+    // connection being DESCRIBED (one JSON/HTTP/Modbus client slot) - two
+    // different things, easy to conflate since both are "a client" in
+    // isolation. Returns the new value for `first` (the caller's own
+    // comma-separator state), unchanged if connClient isn't actually
+    // connected right now (nothing written in that case).
+    template <typename RespClientT, typename ConnClientT>
+    bool write_connection_json_entry(RespClientT &respClient, ConnClientT &connClient, const char *listener,
+                                      uint8_t index, const char *connectedTo, bool first)
+    {
+        if (!connClient || !connClient.connected())
+            return first;
+        if (!first)
+            respClient.print(",");
+        respClient.print("{\"listener\":\"");
+        respClient.print(listener);
+        respClient.print("\",\"index\":");
+        respClient.print(index);
+        respClient.print(",\"remoteIp\":\"");
+        respClient.print(connClient.remoteIP().toString());
+        respClient.print("\",\"remotePort\":");
+        respClient.print(connClient.remotePort());
+        respClient.print(",\"connectedTo\":\"");
+        respClient.print(connectedTo);
+        respClient.print("\"}");
+        return false;
     }
 
     template <typename ClientT>
@@ -2450,6 +3286,76 @@ namespace
             client.print(static_cast<unsigned long>((now - d.lastSeenMs) / 1000));
             client.print("}");
         }
+        client.print("],");
+
+        // Modbus TCP bridge's routing table (see that section's own
+        // comment) - included in the same poll as everything else rather
+        // than a separate endpoint, since every page already refreshes
+        // from this one on the same 5s timer (guarded by `if(el(...))`
+        // checks, same as devicesBody above only actually doing anything
+        // on /modbus itself).
+        client.print("\"modbusRoutes\":[");
+        for (int i = 0, shown = 0; i < kMaxModbusRoutes; i++)
+        {
+            if (!s_modbus_routes[i].inUse)
+                continue;
+            const ModbusRoute &r = s_modbus_routes[i];
+            char macStr[18];
+            mac_to_str(r.mac, macStr, sizeof(macStr));
+            int knownIdx = find_known_device_by_mac(r.mac);
+            if (shown > 0)
+                client.print(",");
+            shown++;
+            client.print("{\"slaveId\":");
+            client.print(r.slaveId);
+            client.print(",\"mac\":\"");
+            client.print(macStr);
+            client.print("\",\"name\":\"");
+            client.print(knownIdx >= 0 ? s_known_devices[knownIdx].friendlyName : "(unknown device)");
+            client.print("\",\"hasRegisters\":");
+            client.print(knownIdx >= 0 && s_known_devices[knownIdx].hasRegisters ? "true" : "false");
+            client.print(",\"ago\":");
+            if (knownIdx >= 0 && s_known_devices[knownIdx].hasRegisters)
+                client.print(static_cast<unsigned long>((now - s_known_devices[knownIdx].registersUpdatedMs) / 1000));
+            else
+                client.print("null");
+            client.print("}");
+        }
+        client.print("],");
+
+        // Connections Management page's own data (see write_http_
+        // connections_page()) - every currently-connected client slot
+        // across both listeners on whichever transport is actually up
+        // (Ethernet/WiFi are mutually exclusive - see setup()'s own
+        // comment), same "included in the same poll as everything else"
+        // reasoning as modbusRoutes above. Only two pools now ("tcp" and
+        // "modbus") since the JSON and HTTP listeners share one pool -
+        // see kHttpPort's own comment for why.
+        client.print("\"connections\":[");
+        bool connFirst = true;
+        char connectedTo[40];
+        if (s_eth_connected)
+        {
+            for (uint8_t i = 0; i < kMaxEthTcpClients; i++)
+                connFirst = write_connection_json_entry(client, s_tcp_clients[i].client, "tcp", i, "-", connFirst);
+            for (uint8_t i = 0; i < kMaxEthModbusClients; i++)
+            {
+                modbus_connected_to_label(s_modbus_eth_states[i].lastSlaveId, connectedTo, sizeof(connectedTo));
+                connFirst = write_connection_json_entry(client, s_modbus_eth_states[i].client, "modbus", i,
+                                                         connectedTo, connFirst);
+            }
+        }
+        else if (s_wifi_connected)
+        {
+            for (uint8_t i = 0; i < kMaxWifiTcpClients; i++)
+                connFirst = write_connection_json_entry(client, s_wifi_tcp_clients[i].client, "tcp", i, "-", connFirst);
+            for (uint8_t i = 0; i < kMaxWifiModbusClients; i++)
+            {
+                modbus_connected_to_label(s_modbus_wifi_states[i].lastSlaveId, connectedTo, sizeof(connectedTo));
+                connFirst = write_connection_json_entry(client, s_modbus_wifi_states[i].client, "modbus", i,
+                                                         connectedTo, connFirst);
+            }
+        }
         client.println("]}");
     }
 
@@ -2517,7 +3423,7 @@ namespace
     }
 
     // GET (not POST - this whole HTTP server only ever parses a request
-    // line, no body/headers - see poll_http_listener's own comment) -
+    // line, no body/headers - see service_tcp_client's own comment) -
     // reboots exactly the one node named over ESP-NOW (do_reboot_send).
     // Rebooting THIS gateway itself is a separate endpoint, see
     // write_http_reboot_self_response below.
@@ -2532,6 +3438,184 @@ namespace
         {
             error = do_reboot_send(mac);
             ok = error == nullptr;
+        }
+        client.println("HTTP/1.1 200 OK");
+        client.println("Content-Type: application/json");
+        client.println("Connection: close");
+        client.println();
+        if (ok)
+            client.println("{\"ok\":true}");
+        else
+            client.printf("{\"ok\":false,\"error\":\"%s\"}\n", error);
+    }
+
+    // GET /api/setting?mac=...&key=...&value=... - reuses do_setting_send
+    // the same way write_http_reboot_response above reuses do_reboot_send.
+    // The value's type isn't in the query string anywhere (unlike the JSON
+    // interface's explicit `valueType`), so it goes through the same
+    // guesswork as the text interface's cmd_setting - see
+    // build_setting_payload_from_string's own comment. Good enough for
+    // this endpoint's actual use (the devices page's "Enable WiFi"
+    // checkbox sends value=true/value=false, which the guesswork maps
+    // straight to RTSNOW_SETTING_BOOL).
+    template <typename ClientT>
+    void write_http_setting_response(ClientT &client, const char *query)
+    {
+        char macStr[24] = "";
+        char key[32] = "";
+        char value[32] = "";
+        uint8_t mac[6];
+        bool ok = false;
+        const char *error = "missing or invalid mac/key/value parameter";
+        if (extract_query_param(query, "mac", macStr, sizeof(macStr)) && parse_mac(macStr, mac) &&
+            extract_query_param(query, "key", key, sizeof(key)) &&
+            extract_query_param(query, "value", value, sizeof(value)))
+        {
+            RTSNOW_SettingPayload payload{};
+            if (build_setting_payload_from_string(key, value, payload, &error))
+            {
+                error = do_setting_send(mac, payload);
+                ok = error == nullptr;
+            }
+        }
+        client.println("HTTP/1.1 200 OK");
+        client.println("Content-Type: application/json");
+        client.println("Connection: close");
+        client.println();
+        if (ok)
+            client.println("{\"ok\":true}");
+        else
+            client.printf("{\"ok\":false,\"error\":\"%s\"}\n", error);
+    }
+
+    // GET /api/modbus_route_add?slaveId=N&mac=AA:BB:CC:DD:EE:FF - see
+    // add_modbus_route()'s own validation (slaveId range, no duplicate
+    // slaveId, no device mapped twice, table-full check).
+    template <typename ClientT>
+    void write_http_modbus_route_add_response(ClientT &client, const char *query)
+    {
+        char slaveIdStr[8] = "";
+        char macStr[24] = "";
+        uint8_t mac[6];
+        bool ok = false;
+        const char *error = "missing or invalid slaveId/mac parameter";
+        if (extract_query_param(query, "slaveId", slaveIdStr, sizeof(slaveIdStr)) &&
+            extract_query_param(query, "mac", macStr, sizeof(macStr)) && parse_mac(macStr, mac))
+        {
+            long slaveIdLong = strtol(slaveIdStr, nullptr, 10);
+            if (slaveIdLong < 1 || slaveIdLong > 247)
+            {
+                error = "slaveId must be 1-247";
+            }
+            else
+            {
+                error = add_modbus_route(static_cast<uint8_t>(slaveIdLong), mac);
+                ok = error == nullptr;
+            }
+        }
+        client.println("HTTP/1.1 200 OK");
+        client.println("Content-Type: application/json");
+        client.println("Connection: close");
+        client.println();
+        if (ok)
+            client.println("{\"ok\":true}");
+        else
+            client.printf("{\"ok\":false,\"error\":\"%s\"}\n", error);
+    }
+
+    // GET /api/modbus_route_remove?slaveId=N
+    template <typename ClientT>
+    void write_http_modbus_route_remove_response(ClientT &client, const char *query)
+    {
+        char slaveIdStr[8] = "";
+        bool ok = false;
+        const char *error = "missing or invalid slaveId parameter";
+        if (extract_query_param(query, "slaveId", slaveIdStr, sizeof(slaveIdStr)))
+        {
+            long slaveIdLong = strtol(slaveIdStr, nullptr, 10);
+            if (slaveIdLong < 1 || slaveIdLong > 247)
+            {
+                error = "slaveId must be 1-247";
+            }
+            else if (!remove_modbus_route(static_cast<uint8_t>(slaveIdLong)))
+            {
+                error = "no route with that slaveId";
+            }
+            else
+            {
+                ok = true;
+            }
+        }
+        client.println("HTTP/1.1 200 OK");
+        client.println("Content-Type: application/json");
+        client.println("Connection: close");
+        client.println();
+        if (ok)
+            client.println("{\"ok\":true}");
+        else
+            client.printf("{\"ok\":false,\"error\":\"%s\"}\n", error);
+    }
+
+    // Forcibly closes one connection from the Connections Management
+    // page (see write_http_connections_page()) - (listener, index) is
+    // exactly the pair write_connection_json_entry() reported it under,
+    // so the browser never needs any other identifier. Only ever
+    // matches a slot on whichever transport is actually up right now
+    // (Ethernet/WiFi are mutually exclusive) - a listener/index that
+    // would be valid on the OTHER transport just falls through to
+    // "unknown listener or index out of range" below, same as one that's
+    // simply out of range.
+    bool disconnect_connection(const char *listener, uint8_t index, const char **error)
+    {
+        if (s_eth_connected)
+        {
+            if (strcmp(listener, "tcp") == 0 && index < kMaxEthTcpClients)
+            {
+                s_tcp_clients[index].client.stop();
+                s_tcp_clients[index].reset();
+                return true;
+            }
+            if (strcmp(listener, "modbus") == 0 && index < kMaxEthModbusClients)
+            {
+                s_modbus_eth_states[index].client.stop();
+                s_modbus_eth_states[index].reset();
+                return true;
+            }
+        }
+        else if (s_wifi_connected)
+        {
+            if (strcmp(listener, "tcp") == 0 && index < kMaxWifiTcpClients)
+            {
+                s_wifi_tcp_clients[index].client.stop();
+                s_wifi_tcp_clients[index].reset();
+                return true;
+            }
+            if (strcmp(listener, "modbus") == 0 && index < kMaxWifiModbusClients)
+            {
+                s_modbus_wifi_states[index].client.stop();
+                s_modbus_wifi_states[index].reset();
+                return true;
+            }
+        }
+        *error = "unknown listener or index out of range";
+        return false;
+    }
+
+    template <typename ClientT>
+    void write_http_connection_disconnect_response(ClientT &client, const char *query)
+    {
+        char listener[16] = "";
+        char indexStr[8] = "";
+        bool ok = false;
+        const char *error = "missing or invalid listener/index parameter";
+        if (extract_query_param(query, "listener", listener, sizeof(listener)) &&
+            extract_query_param(query, "index", indexStr, sizeof(indexStr)))
+        {
+            long indexLong = strtol(indexStr, nullptr, 10);
+            if (indexLong < 0 || indexLong > 255)
+                error = "index must be 0-255";
+            else
+                ok = disconnect_connection(listener, static_cast<uint8_t>(indexLong), &error);
         }
         client.println("HTTP/1.1 200 OK");
         client.println("Content-Type: application/json");
@@ -2561,138 +3645,43 @@ namespace
         ESP.restart();
     }
 
-    // One slot's worth of request handling - accepting into a free/
-    // evicted slot and iterating every connected slot both happen in
-    // poll_http_listener() below, mirroring poll_tcp_clients()'s own
-    // multi-slot pattern (same reasoning: a single-client design silently
-    // refuses every additional simultaneous connection instead of queuing
-    // it, and a real browser opens several at once per page load - see
-    // kMaxEthHttpClients's own comment for how this was actually found).
+    // The actual HTTP route table - called from service_tcp_client()
+    // (much earlier in this file, forward-declared there) once a
+    // connection's first line has been confirmed to start with "GET ".
+    // Used to be inline in a now-removed service_http_client() that this
+    // shared pool has no equivalent of anymore (a one-shot HTTP request
+    // now just dispatches straight out of the same per-connection state
+    // machine used for a persistent JSON/text session - see kHttpPort's
+    // own comment for the whole reasoning).
     template <typename ClientT>
-    void service_http_client(HttpListenerState<ClientT> &st)
+    void dispatch_http_request(ClientT &client, const char *path, const char *query)
     {
-        while (st.client.available())
-        {
-            char c = static_cast<char>(st.client.read());
-            if (c == '\n')
-            {
-                st.requestLineDone = true;
-                break;
-            }
-            if (c != '\r' && st.requestLineLen < sizeof(st.requestLine) - 1)
-                st.requestLine[st.requestLineLen++] = c;
-        }
-
-        if (st.requestLineDone)
-        {
-            st.requestLine[st.requestLineLen] = '\0';
-            char path[32];
-            char query[64];
-            extract_http_request(st.requestLine, path, sizeof(path), query, sizeof(query));
-            if (strcmp(path, "/api/status") == 0)
-                write_http_status_json(st.client);
-            else if (strcmp(path, "/api/reboot") == 0)
-                write_http_reboot_response(st.client, query);
-            else if (strcmp(path, "/api/reboot_self") == 0)
-                write_http_reboot_self_response(st.client);
-            else if (strcmp(path, "/logo.gif") == 0)
-                write_http_logo(st.client);
-            else if (strcmp(path, "/network") == 0)
-                write_http_network_page(st.client);
-            else if (strcmp(path, "/devices") == 0)
-                write_http_devices_page(st.client);
-            else if (strcmp(path, "/system") == 0)
-                write_http_system_page(st.client);
-            else
-                write_http_home_page(st.client);
-            st.client.stop();
-            st.reset();
-            return;
-        }
-
-        if (millis() - st.clientStartMs > kHttpClientTimeoutMs)
-        {
-            st.client.stop();
-            st.reset();
-        }
-    }
-
-    template <typename ServerT, typename ClientT>
-    void poll_http_listener(ServerT &server, HttpListenerState<ClientT> *states, uint8_t clientCount)
-    {
-        // Keeps accepting into every free slot, not just the first one -
-        // a single accept() per call meant several truly-simultaneous
-        // incoming connections (confirmed live: a browser's document +
-        // logo + immediate AJAX fetch, all landing in the same instant)
-        // only ever got ONE of them serviced per tick even with multiple
-        // slots configured, since the loop used to stop right after the
-        // first free slot regardless of whether more were both free and
-        // pending. Only stops early once accept() itself has nothing left
-        // to give - trying further free slots after that wouldn't help.
-        bool anyFree = false;
-        for (uint8_t i = 0; i < clientCount; i++)
-        {
-            if (!states[i].client || !states[i].client.connected())
-            {
-                anyFree = true;
-                ClientT incoming = server.accept();
-                if (!incoming)
-                    break;
-                states[i].client = incoming;
-                states[i].reset();
-                states[i].clientStartMs = millis();
-            }
-        }
-        if (!anyFree)
-        {
-            // Every slot full - evict the oldest (slot 0, same reasoning
-            // as poll_tcp_clients()'s own comment: a small, short-lived
-            // array isn't worth real LRU bookkeeping) rather than refuse
-            // the new connection outright - the exact behavior that
-            // caused this whole class of bug in the first place.
-            ClientT incoming = server.accept();
-            if (incoming)
-            {
-                states[0].client.stop();
-                states[0].client = incoming;
-                states[0].reset();
-                states[0].clientStartMs = millis();
-            }
-        }
-
-        for (uint8_t i = 0; i < clientCount; i++)
-            if (states[i].client && states[i].client.connected())
-                service_http_client(states[i]);
-    }
-
-    bool s_http_eth_started = false;
-    bool s_http_wifi_started = false;
-
-    // One-shot, boot-time decision, matching s_eth_connected/s_wifi_connected
-    // themselves (see setup()'s own comment) - not re-checked after boot.
-    void begin_http_status_server()
-    {
-        if (s_eth_connected)
-        {
-            s_http_eth_server.begin();
-            s_http_eth_started = true;
-            Serial.printf("HTTP status page (Ethernet) listening on http://%s/\n",
-                          Ethernet.localIP().toString().c_str());
-        }
-        else if (s_wifi_connected)
-        {
-            s_http_wifi_server.begin();
-            s_http_wifi_started = true;
-            Serial.printf("HTTP status page (WiFi) listening on http://%s/\n", WiFi.localIP().toString().c_str());
-        }
-    }
-
-    void poll_http_status_server()
-    {
-        if (s_http_eth_started)
-            poll_http_listener(s_http_eth_server, s_http_eth_states, kMaxEthHttpClients);
-        else if (s_http_wifi_started)
-            poll_http_listener(s_http_wifi_server, s_http_wifi_states, kMaxWifiHttpClients);
+        if (strcmp(path, "/api/status") == 0)
+            write_http_status_json(client);
+        else if (strcmp(path, "/api/reboot") == 0)
+            write_http_reboot_response(client, query);
+        else if (strcmp(path, "/api/reboot_self") == 0)
+            write_http_reboot_self_response(client);
+        else if (strcmp(path, "/api/setting") == 0)
+            write_http_setting_response(client, query);
+        else if (strcmp(path, "/api/modbus_route_add") == 0)
+            write_http_modbus_route_add_response(client, query);
+        else if (strcmp(path, "/api/modbus_route_remove") == 0)
+            write_http_modbus_route_remove_response(client, query);
+        else if (strcmp(path, "/api/connection_disconnect") == 0)
+            write_http_connection_disconnect_response(client, query);
+        else if (strcmp(path, "/network") == 0)
+            write_http_network_page(client);
+        else if (strcmp(path, "/devices") == 0)
+            write_http_devices_page(client);
+        else if (strcmp(path, "/modbus") == 0)
+            write_http_modbus_page(client);
+        else if (strcmp(path, "/connections") == 0)
+            write_http_connections_page(client);
+        else if (strcmp(path, "/system") == 0)
+            write_http_system_page(client);
+        else
+            write_http_home_page(client);
     }
 #endif
 
@@ -2749,12 +3738,6 @@ namespace
         Serial.printf("Forgot %s - it'll reappear if it announces/heartbeats again\n", macStr);
     }
 
-    // Auto-detects the setting's value type from its typed-in text form:
-    // "true"/"false" -> bool, a clean integer -> int32, a clean float ->
-    // float32, anything else -> string. A human-typed convenience, not
-    // part of the wire protocol itself (RTSNOW_SettingPayload just carries
-    // whatever type is decided here). The JSON interface skips this
-    // guesswork entirely - see handle_setting_command's explicit `valueType`.
     void cmd_setting(const char *macStr, const char *key, const char *value)
     {
         uint8_t mac[6];
@@ -2763,48 +3746,16 @@ namespace
             Serial.println("setting: invalid MAC address");
             return;
         }
-        if (strlen(key) >= sizeof(RTSNOW_SettingPayload::key))
+
+        RTSNOW_SettingPayload payload{};
+        const char *error = nullptr;
+        if (!build_setting_payload_from_string(key, value, payload, &error))
         {
-            Serial.println("setting: key too long");
+            Serial.printf("setting: %s\n", error);
             return;
         }
 
-        RTSNOW_SettingPayload payload{};
-        strncpy(payload.key, key, sizeof(payload.key) - 1);
-
-        char *end = nullptr;
-        long asInt = strtol(value, &end, 10);
-        bool isInt = (end != value && *end == '\0');
-        float asFloat = strtof(value, &end);
-        bool isFloat = (end != value && *end == '\0');
-
-        if (strcmp(value, "true") == 0 || strcmp(value, "false") == 0)
-        {
-            payload.valueType = RTSNOW_SETTING_BOOL;
-            payload.boolValue = (strcmp(value, "true") == 0);
-        }
-        else if (isInt)
-        {
-            payload.valueType = RTSNOW_SETTING_INT32;
-            payload.intValue = static_cast<int32_t>(asInt);
-        }
-        else if (isFloat)
-        {
-            payload.valueType = RTSNOW_SETTING_FLOAT32;
-            payload.floatValue = asFloat;
-        }
-        else
-        {
-            if (strlen(value) >= sizeof(payload.stringValue))
-            {
-                Serial.println("setting: string value too long");
-                return;
-            }
-            payload.valueType = RTSNOW_SETTING_STRING;
-            strncpy(payload.stringValue, value, sizeof(payload.stringValue) - 1);
-        }
-
-        const char *error = do_setting_send(mac, payload);
+        error = do_setting_send(mac, payload);
         if (error != nullptr)
         {
             Serial.printf("setting: %s\n", error);
@@ -2847,6 +3798,36 @@ namespace
         Serial.printf("Requested registers from %s\n", macStr);
     }
 
+    void cmd_write_register(const char *macStr, const char *regStr, const char *valueStr)
+    {
+        uint8_t mac[6];
+        if (!parse_mac(macStr, mac))
+        {
+            Serial.println("write_register: invalid MAC address");
+            return;
+        }
+        char *end = nullptr;
+        long reg = strtol(regStr, &end, 10);
+        if (end == regStr || *end != '\0' || reg < 0 || reg > 0xFFFF)
+        {
+            Serial.println("write_register: invalid register number");
+            return;
+        }
+        float value = strtof(valueStr, &end);
+        if (end == valueStr)
+        {
+            Serial.println("write_register: invalid value");
+            return;
+        }
+        const char *error = do_write_register_send(mac, static_cast<uint16_t>(reg), value);
+        if (error != nullptr)
+        {
+            Serial.printf("write_register: %s\n", error);
+            return;
+        }
+        Serial.printf("Sent write_register %ld=%g to %s\n", reg, value, macStr);
+    }
+
     void cmd_channel(const char *arg)
     {
         char *end = nullptr;
@@ -2871,6 +3852,7 @@ namespace
         Serial.println("  setting <mac> <key> <value>          - push a generic setting to a known device");
         Serial.println("  reboot <mac>                         - ask a known device to restart");
         Serial.println("  poll_registers <mac>                 - ask a known device to report its register table");
+        Serial.println("  write_register <mac> <reg> <value>   - write one register on a known device (e.g. start/stop)");
         Serial.println("  channel <1-11>                       - change/persist this gateway's own ESP-NOW channel");
         Serial.println("  discover                             - broadcast RTSNOW_DISCOVER now");
         Serial.println("  help                                 - show this list");
@@ -2935,6 +3917,16 @@ namespace
                 Serial.println("usage: reboot <mac>");
             else
                 cmd_reboot(mac);
+        }
+        else if (strcmp(cmd, "write_register") == 0)
+        {
+            char *mac = strtok(nullptr, " ");
+            char *reg = strtok(nullptr, " ");
+            char *value = strtok(nullptr, " ");
+            if (!mac || !reg || !value)
+                Serial.println("usage: write_register <mac> <reg> <value>");
+            else
+                cmd_write_register(mac, reg, value);
         }
         else if (strcmp(cmd, "poll_registers") == 0)
         {
@@ -3093,6 +4085,26 @@ namespace
         }
         const char *error = do_request_registers_send(mac);
         send_ack("poll_registers", &doc, error == nullptr, error);
+    }
+
+    // This ack (send_ack, event "ack"/cmd "write_register") only confirms
+    // the ESP-NOW packet went out - the real outcome is
+    // RTSNOW_WRITE_REGISTER_ACK, relayed to the desktop app as its own
+    // "write_register_ack" event (see that message's receive-side
+    // handling) once the target node actually replies.
+    void handle_write_register_command(const JsonDocument &doc)
+    {
+        const char *macStr = doc["mac"] | "";
+        uint8_t mac[6];
+        if (!parse_mac(macStr, mac))
+        {
+            send_ack("write_register", &doc, false, "invalid MAC address");
+            return;
+        }
+        uint16_t reg = doc["reg"] | 0;
+        float value = doc["value"] | 0.0f;
+        const char *error = do_write_register_send(mac, reg, value);
+        send_ack("write_register", &doc, error == nullptr, error);
     }
 
     // ---- Firmware update over ESP-NOW: JSON command handlers ----
@@ -3323,6 +4335,8 @@ namespace
             handle_reboot_command(doc);
         else if (strcmp(cmd, "poll_registers") == 0)
             handle_poll_registers_command(doc);
+        else if (strcmp(cmd, "write_register") == 0)
+            handle_write_register_command(doc);
         else if (strcmp(cmd, "espnow_ota_start") == 0)
             handle_espnow_ota_start_command(doc);
         else if (strcmp(cmd, "espnow_ota_chunk") == 0)
@@ -3454,7 +4468,8 @@ namespace
             hb.identity.deviceTypeName[sizeof(hb.identity.deviceTypeName) - 1] = '\0';
             hb.identity.friendlyName[sizeof(hb.identity.friendlyName) - 1] = '\0';
             hb.boardName[sizeof(hb.boardName) - 1] = '\0';
-            note_known_device(mac, hb.identity, hb.wifiRssi, hb.boardName, hb.neighborCount, hb.neighbors);
+            note_known_device(mac, hb.identity, hb.wifiRssi, /*wifiRssiFresh=*/true, hb.boardName, hb.neighborCount,
+                               hb.neighbors);
             break;
         }
         case RTSNOW_PROVISION_REQUEST:
@@ -3492,6 +4507,19 @@ namespace
             char macStr[18];
             mac_to_str(mac, macStr, sizeof(macStr));
 
+            // Cache for the Modbus TCP bridge (see KnownDevice::
+            // lastRegisters's own comment) - independent of, and in
+            // addition to, the live JSON forwarding below (a TCP/serial
+            // client watching for register_values events still gets one
+            // per arrival, same as before this cache existed).
+            int knownIdx = find_known_device_by_mac(mac);
+            if (knownIdx >= 0)
+            {
+                s_known_devices[knownIdx].lastRegisters = block;
+                s_known_devices[knownIdx].hasRegisters = true;
+                s_known_devices[knownIdx].registersUpdatedMs = millis();
+            }
+
             JsonDocument doc;
             doc["event"] = "register_values";
             doc["mac"] = macStr;
@@ -3500,6 +4528,28 @@ namespace
             for (uint16_t i = 0; i < block.registerCount; i++)
                 values.add(block.values[i]);
             emit_json(doc); // called from the ESP-NOW callback - see "Deferred Serial output"
+            break;
+        }
+        case RTSNOW_WRITE_REGISTER_ACK:
+        {
+            if (payloadLen < static_cast<int>(sizeof(RTSNOW_WriteRegisterAck)))
+                return;
+            RTSNOW_WriteRegisterAck ack;
+            memcpy(&ack, payload, sizeof(ack));
+            // resolve_true_mac_str, not a plain mac_to_str(mac, ...) - same
+            // reasoning as the OTA acks just below: a relayed ack's
+            // physical sender (mac) differs from the true originating
+            // node (header.sourceID), and this message can be relayed the
+            // same general destinationID-based way OTA chunks are.
+            char macStr[18];
+            resolve_true_mac_str(header.sourceID, mac, macStr, sizeof(macStr));
+
+            JsonDocument doc;
+            doc["event"] = "write_register_ack";
+            doc["mac"] = macStr;
+            doc["reg"] = ack.reg;
+            doc["ok"] = static_cast<bool>(ack.ok);
+            emit_json(doc);
             break;
         }
         case RTSNOW_OTA_START_ACK:
@@ -3781,16 +4831,26 @@ void setup()
     {
         Serial.println("Ethernet OK - skipping WiFi fallback (never both at once, see this section's own comment).");
     }
-    begin_http_status_server();
-    if (s_eth_connected)
-        begin_mdns_ethernet();
-    else if (s_wifi_connected)
+    // The shared HTTP/JSON listener itself is started lazily from inside
+    // poll_tcp_server() (see its own comment) - nothing to do here.
+    // Ethernet mDNS deliberately NOT started anymore (begin_mdns_ethernet()
+    // is unused below, kept in case this trade needs reverting) - it
+    // permanently held one of the W5500's fixed 8 hardware sockets, and
+    // that socket is worth far more to the Modbus TCP bridge (see
+    // kMaxEthModbusClients's own comment) - nothing in this whole project
+    // has ever actually been reached via a rtsnow-gateway.local hostname
+    // instead of its raw IP, confirmed live: every single interaction
+    // with this gateway, across every tool built this session, used its
+    // IP address directly. WiFi's own mDNS below is untouched - that
+    // transport has no equivalent hardware socket ceiling to relieve.
+    if (s_wifi_connected)
     {
         if (MDNS.begin(kMdnsHostname))
             Serial.printf("mDNS (WiFi): responding to %s.local queries\n", kMdnsHostname);
         else
             Serial.println("mDNS (WiFi): MDNS.begin() failed");
     }
+    load_modbus_routes();  // Modbus TCP bridge's persisted slaveId->MAC table - see its own section
 #endif
 
     if (esp_now_init() != ESP_OK)
@@ -3847,7 +4907,7 @@ void loop()
     if (s_eth_connected)
         Ethernet.maintain();  // renews the DHCP lease as needed; no-op otherwise
     poll_tcp_server();
-    poll_http_status_server();
+    poll_modbus_server();
     if (s_eth_connected)
         poll_mdns_ethernet();
     // WiFi's own mDNS (ESPmDNS/esp-idf mdns component) runs its own

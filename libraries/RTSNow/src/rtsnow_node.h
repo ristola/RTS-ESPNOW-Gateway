@@ -58,6 +58,20 @@ struct RTSNowNodeConfig
     using RegisterBlockProvider = void (*)(RTSNOW_RegisterBlock &outBlock);
     RegisterBlockProvider registerBlockProvider = nullptr;
 
+    // Optional: called from rtsnowNodeLoop() (never from the ESP-NOW
+    // receive callback - same discipline as every other hook here) when a
+    // gateway/desktop-app RTSNOW_WRITE_REGISTER arrives, so the host
+    // project can apply it through its own real write path (e.g. queue it
+    // the exact same way a local Modbus TCP client's write already is,
+    // rather than reimplementing the safety/validation logic here). Return
+    // true if this register is one the project knows how to write and the
+    // write was accepted - this becomes the RTSNOW_WRITE_REGISTER_ACK's
+    // `ok` field. Left null (the default) on a node with no writable
+    // registers at all - the request is then just rejected with ok=false,
+    // same as an unrecognized RTSNOW_SET_SETTING key.
+    using RegisterWriteHandler = bool (*)(uint16_t reg, float value);
+    RegisterWriteHandler onWriteRegister = nullptr;
+
     // Optional: called once, synchronously, right before rtsnowNodeLoop()
     // calls ESP.restart() in response to a RTSNOW_REBOOT - a chance for the
     // host project to give a clear visible "rebooting now" signal on its

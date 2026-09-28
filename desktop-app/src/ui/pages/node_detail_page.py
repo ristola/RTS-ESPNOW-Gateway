@@ -16,7 +16,6 @@ from PySide6.QtWidgets import (
 )
 
 from src.gateway.models import GATEWAY_DEVICE_TYPES, KnownDevice, device_type_label
-from src.gateway.polymerpak_status import PolymerPakStatusPoller
 
 # Mirrors DeviceSettings.h's kDryerModels/kCrystallizerModels and
 # modelTypeCode()'s 0-7 encoding exactly - these are compile-time
@@ -49,9 +48,47 @@ POLYMERPAK_FIELDS = [
     ("trackerStepDeg", "Tracker Step (deg)"),
 ]
 
+# Live sun-position telemetry, added to fillRegisterBlock() (registers
+# 9-16, right after POLYMERPAK_FIELDS's own 1-8) alongside the settings
+# above - read-only (no RTSNOW_SET_SETTING key backs these, unlike
+# POLYMERPAK_FIELDS), so these are never wired into an editable
+# DoubleClickToEditLineEdit the way the settings above are, just decoded
+# for display. field_index continues where POLYMERPAK_FIELDS left off (4,
+# 5, 6, 7) - decode_polymerpak_register_pair() doesn't care which list an
+# index came from, just its position in the packed register layout.
+POLYMERPAK_TELEMETRY_FIELDS = [
+    ("elevationDeg", "Elevation (deg)"),
+    ("azimuthDeg", "Azimuth (deg)"),
+    ("elRateDegPerMin", "EL Rate (deg/min)"),
+    ("azRateDegPerMin", "AZ Rate (deg/min)"),
+]
+
+
+def decode_polymerpak_register_pair(values: list[int], start_register: int, field_index: int) -> str | None:
+    """Decodes the field_index-th packed value (0-based, spanning
+    POLYMERPAK_FIELDS then POLYMERPAK_TELEMETRY_FIELDS in order) out of a
+    raw register poll - see fillRegisterBlock() in that project's
+    main.cpp: each value is a float scaled by 10000 and packed across a
+    high/low register pair, starting at register 1. Returns None if this
+    particular poll didn't cover that pair (e.g. a short/partial poll)."""
+    hi_index = 1 + field_index * 2 - start_register
+    lo_index = hi_index + 1
+    if hi_index < 0 or lo_index >= len(values):
+        return None
+    scaled = (values[hi_index] << 16) | values[lo_index]
+    if scaled >= 1 << 31:  # two's complement sign extension
+        scaled -= 1 << 32
+    return f"{scaled / 10000.0:g}"
+
+
 # PolymerPak's /api/status JSON keys (see that project's handleApiStatus())
 # -> (field label, format string) for the read-only "Live Status" column -
-# mirrors that node's own web dashboard.
+# mirrors that node's own web dashboard. elevationDeg/azimuthDeg/
+# elRateDegPerMin/azRateDegPerMin here overlap with POLYMERPAK_TELEMETRY_
+# FIELDS above (same values, HTTP-fetched here vs. register-poll-decoded
+# there - see fillRegisterBlock()'s own comment for why moveEl/moveAz/
+# usableWindow/localTime stay HTTP-only) - this list drives the separate
+# "Live Status" column, unrelated to the Registers table.
 POLYMERPAK_STATUS_FIELDS = [
     ("elevationDeg", "Elevation"),
     ("azimuthDeg", "Azimuth"),
@@ -224,65 +261,6 @@ class NodeDetailPage(QWidget):
 
         layout.addWidget(config_box)
         self.config_box = config_box
-
-        # A completely different project (solar-tracker controller, see
-        # "Customer Projects/PolymerPak") reachable through this same
-        # Node Detail page via the Dashboard's device table (see
-        # main_window.py's _rebuild_rtsnow_children() docstring) - it has
-        # none of SPI-IM's Equipment/Model/SPI Address/Baud Rate concepts,
-        # so it gets its own Configuration box instead, shown/hidden by
-        # dev.project_name in show_device() rather than sharing config_box.
-        polymerpak_config_box = QGroupBox("Configuration (PolymerPak)")
-        polymerpak_columns = QHBoxLayout(polymerpak_config_box)
-
-        # Left column: the 4 persisted settings (see TrackerSettings.h) -
-        # same double-click-to-edit pattern as SPI-IM's SPI Address.
-        settings_column = QVBoxLayout()
-        self.polymerpak_edits: dict[str, DoubleClickToEditLineEdit] = {}
-        self._polymerpak_last_known: dict[str, str] = {}
-        for key, label in POLYMERPAK_FIELDS:
-            row = QHBoxLayout()
-            row.addWidget(QLabel(label + ":"))
-            edit = DoubleClickToEditLineEdit()
-            edit.setMaximumWidth(120)
-            edit.editingFinished.connect(lambda k=key: self._on_polymerpak_field_editing_finished(k))
-            self.polymerpak_edits[key] = edit
-            self._polymerpak_last_known[key] = ""
-            row.addWidget(edit)
-            row.addStretch(1)
-            settings_column.addLayout(row)
-
-        self.polymerpak_status_label = QLabel("Poll registers to see this node's current configuration.")
-        self.polymerpak_status_label.setStyleSheet("color: gray;")
-        settings_column.addWidget(self.polymerpak_status_label)
-        settings_column.addStretch(1)
-        polymerpak_columns.addLayout(settings_column, stretch=1)
-
-        # Right column: read-only live sun-position telemetry, fetched
-        # over plain HTTP from the node's own /api/status (see
-        # PolymerPakStatusPoller) - the same numbers as that node's own
-        # web dashboard, just alongside the settings that drive them
-        # instead of on a separate page.
-        live_column = QVBoxLayout()
-        live_column.addWidget(QLabel("Live Status:"))
-        self.polymerpak_live_labels: dict[str, QLabel] = {}
-        for key, label in POLYMERPAK_STATUS_FIELDS:
-            row = QHBoxLayout()
-            row.addWidget(QLabel(label + ":"))
-            value_label = QLabel("-")
-            self.polymerpak_live_labels[key] = value_label
-            row.addWidget(value_label)
-            row.addStretch(1)
-            live_column.addLayout(row)
-        self.polymerpak_live_status_label = QLabel("")
-        self.polymerpak_live_status_label.setStyleSheet("color: gray;")
-        live_column.addWidget(self.polymerpak_live_status_label)
-        live_column.addStretch(1)
-        polymerpak_columns.addLayout(live_column, stretch=1)
-
-        layout.addWidget(polymerpak_config_box)
-        self.polymerpak_config_box = polymerpak_config_box
-        self._polymerpak_poller: PolymerPakStatusPoller | None = None
         self._rebuild_model_buttons("Dryer")
 
         remote_box = QGroupBox("Remote Control")
@@ -301,8 +279,8 @@ class NodeDetailPage(QWidget):
         self.registers_status_label.setStyleSheet("color: gray;")
         remote_layout.addWidget(self.registers_status_label)
 
-        self.registers_table = QTableWidget(0, 2)
-        self.registers_table.setHorizontalHeaderLabels(["Register", "Value"])
+        self.registers_table = QTableWidget(0, 3)
+        self.registers_table.setHorizontalHeaderLabels(["Register", "Name", "Value"])
         self.registers_table.verticalHeader().setVisible(False)
         self.registers_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.registers_table.setMaximumHeight(220)
@@ -385,64 +363,11 @@ class NodeDetailPage(QWidget):
         self._mac = None
         self._ip = None
         self._current_project_name = None
-        self._stop_polymerpak_poller()
         self.placeholder_label.setVisible(True)
         self.identity_box.setVisible(False)
         self.config_box.setVisible(False)
-        self.polymerpak_config_box.setVisible(False)
         self.remote_box.setVisible(False)
         self.ota_box.setVisible(False)
-
-    def _stop_polymerpak_poller(self):
-        poller = self._polymerpak_poller
-        self._polymerpak_poller = None
-        if poller is None:
-            return
-        # Disconnect first so a reply already in flight when stop() is
-        # called can't touch the UI after it's moved to a different
-        # device. Then block briefly (bounded by STOP_WAIT_MS) so the
-        # underlying OS thread has actually exited before this last
-        # reference to it is dropped - destroying a QThread object while
-        # its thread is still running is undefined behavior in Qt, not
-        # just a leak. A short stall here (rare - only on an actual
-        # device switch, at most a few seconds) beats that risk.
-        poller.status_received.disconnect(self._on_polymerpak_status_received)
-        poller.status_error.disconnect(self._on_polymerpak_status_error)
-        poller.stop()
-        poller.wait(PolymerPakStatusPoller.STOP_WAIT_MS)
-
-    def _start_polymerpak_poller(self, ip: str):
-        self._polymerpak_poller = PolymerPakStatusPoller(ip)
-        self._polymerpak_poller.status_received.connect(self._on_polymerpak_status_received)
-        self._polymerpak_poller.status_error.connect(self._on_polymerpak_status_error)
-        self._polymerpak_poller.start()
-
-    # Explicit per-key formatting instead of guessing from the value's
-    # type/key name - only elevationDeg gets the "(UP)"/"(DOWN)" suffix
-    # (from the JSON's separate "sunUp" bool), matching the webpage's own
-    # badge next to its Elevation figure.
-    _POLYMERPAK_STATUS_FORMATTERS = {
-        "elevationDeg": lambda v: f"{v:.1f}°",
-        "azimuthDeg": lambda v: f"{v:.1f}°",
-        "elRateDegPerMin": lambda v: f"{v:+.2f} °/min",
-        "azRateDegPerMin": lambda v: f"{v:+.2f} °/min",
-    }
-
-    def _on_polymerpak_status_received(self, data: dict):
-        for key, label_widget in self.polymerpak_live_labels.items():
-            value = data.get(key)
-            if value is None:
-                label_widget.setText("-")
-                continue
-            formatter = self._POLYMERPAK_STATUS_FORMATTERS.get(key)
-            text = formatter(value) if formatter else str(value)
-            if key == "elevationDeg" and "sunUp" in data:
-                text += " (UP)" if data["sunUp"] else " (DOWN)"
-            label_widget.setText(text)
-        self.polymerpak_live_status_label.setText("Live - updated just now.")
-
-    def _on_polymerpak_status_error(self, message: str):
-        self.polymerpak_live_status_label.setText(f"Could not reach node's HTTP status endpoint: {message}")
 
     def show_device(self, dev: KnownDevice):
         is_new_selection = dev.mac != self._mac
@@ -458,30 +383,19 @@ class NodeDetailPage(QWidget):
         self.identity_box.setVisible(True)
         # The Equipment/Model/SPI Address/Baud Rate section only makes
         # sense for SPI-IM/RTSNow nodes with actual RS-485 equipment
-        # attached - a different project reached via the Dashboard's
-        # device table (e.g. PolymerPak's solar tracker, see
-        # POLYMERPAK_FIELDS) gets its own Configuration box instead, and
-        # neither RTS-NOW gateway (USB dongle or PoE/Ethernet - see
-        # GATEWAY_DEVICE_TYPES) has any RS-485 transceiver wired to
-        # anything at all, so neither has equipment configuration to show
-        # either. Anything unrecognized shows neither, rather than
-        # guessing. (Bug fixed 2026-09-26: this used to only exclude
-        # "EthernetGateway" by name, so the dongle's own then-newly-
-        # renamed "UsbGateway" type slipped through and showed a bogus
-        # Dryer/Crystallizer config box for it.)
+        # attached - PolymerPak's solar tracker has its own dedicated
+        # PolymerPakDetailPage entirely (never reaches this page - see
+        # main_window.py's _show_device_page), and neither RTS-NOW gateway
+        # (USB dongle or PoE/Ethernet - see GATEWAY_DEVICE_TYPES) has any
+        # RS-485 transceiver wired to anything at all, so it has no
+        # equipment configuration to show either. Anything unrecognized
+        # shows neither, rather than guessing. (Bug fixed 2026-09-26: this
+        # used to only exclude "EthernetGateway" by name, so the dongle's
+        # own then-newly-renamed "UsbGateway" type slipped through and
+        # showed a bogus Dryer/Crystallizer config box for it.)
         self.config_box.setVisible(dev.project_name == "RTSNow" and dev.device_type_name not in GATEWAY_DEVICE_TYPES)
-        self.polymerpak_config_box.setVisible(dev.project_name == "PolymerPak")
         self.remote_box.setVisible(True)
         self.ota_box.setVisible(True)
-
-        if is_new_selection:
-            # Only (re)start the poller on an actual device switch, not
-            # every periodic known_devices refresh - restarting it every
-            # time would otherwise re-fire "Requested..." status text
-            # continuously even when nothing changed.
-            self._stop_polymerpak_poller()
-            if dev.project_name == "PolymerPak" and dev.ip:
-                self._start_polymerpak_poller(dev.ip)
 
         self.device_id_label.setText(f"0x{dev.device_id:08X}")
         self.project_label.setText(dev.project_name)
@@ -520,12 +434,11 @@ class NodeDetailPage(QWidget):
         return self._mac
 
     def shutdown(self):
-        """Call on application exit - destroying a QThread while its
-        underlying OS thread is still running is undefined behavior in Qt
-        (see _stop_polymerpak_poller's comment), and nothing else stops
-        this page's poller once the app is closing, not just navigated
-        away from."""
-        self._stop_polymerpak_poller()
+        """Call on application exit - a no-op now that this page has no
+        background poller of its own (PolymerPak's own poller moved to
+        PolymerPakDetailPage along with everything else PolymerPak-
+        specific), kept only so main_window.py's closeEvent can still
+        call every detail page's shutdown() uniformly."""
 
     def _update_ota_enabled(self):
         self.ota_push_btn.setEnabled(bool(self._ip and self._ota_file_path))
@@ -583,40 +496,18 @@ class NodeDetailPage(QWidget):
         self.registers_table.setRowCount(len(values))
         for row, value in enumerate(values):
             self.registers_table.setItem(row, 0, QTableWidgetItem(str(start_register + row)))
-            self.registers_table.setItem(row, 1, QTableWidgetItem(str(value)))
+            self.registers_table.setItem(row, 1, QTableWidgetItem(""))
+            self.registers_table.setItem(row, 2, QTableWidgetItem(str(value)))
         self._update_config_from_registers(start_register, values)
 
     def _update_config_from_registers(self, start_register: int, values: list[int]):
         """Dispatches to the right decode for whichever project owns the
-        currently-selected device - SPI-IM/RTSNow's Modbus-style 400xx
-        registers and PolymerPak's own scaled-float register layout mean
-        completely different things at the same register numbers, so
-        this must never try to decode one project's block as the
-        other's."""
-        if self._current_project_name == "PolymerPak":
-            self._update_polymerpak_config_from_registers(start_register, values)
-        elif self._current_project_name == "RTSNow":
+        currently-selected device. PolymerPak's own scaled-float register
+        layout has its own dedicated page (PolymerPakDetailPage) entirely
+        now, so this only ever needs to handle RTSNow's Modbus-style
+        400xx registers."""
+        if self._current_project_name == "RTSNow":
             self._update_rtsnow_config_from_registers(start_register, values)
-
-    def _update_polymerpak_config_from_registers(self, start_register: int, values: list[int]):
-        """Decodes PolymerPak's fillRegisterBlock() layout (see that
-        project's main.cpp): 4 values, each spanning 2 registers
-        (high word then low word) scaled by 10000, starting at register
-        1 - siteLatitude, siteLongitude, sunElevationDeg, trackerStepDeg
-        in that order (see POLYMERPAK_FIELDS)."""
-        for i, (key, _label) in enumerate(POLYMERPAK_FIELDS):
-            hi_index = 1 + i * 2 - start_register
-            lo_index = hi_index + 1
-            if hi_index < 0 or lo_index >= len(values):
-                continue
-            scaled = (values[hi_index] << 16) | values[lo_index]
-            if scaled >= 1 << 31:  # two's complement sign extension
-                scaled -= 1 << 32
-            text = f"{scaled / 10000.0:g}"
-            self._polymerpak_last_known[key] = text
-            if not self.polymerpak_edits[key].hasFocus():
-                self.polymerpak_edits[key].setText(text)
-        self.polymerpak_status_label.setText("Reflects this node's configuration as of the last register poll.")
 
     def _update_rtsnow_config_from_registers(self, start_register: int, values: list[int]):
         """Decodes Station ID (40002)/Baud Rate (40003)/Model Type (40004)
@@ -706,43 +597,8 @@ class NodeDetailPage(QWidget):
         self.config_status_label.setText(f"Sent - awaiting node confirmation ({baud} baud)...")
         self.config_setting_requested.emit(self._mac, "spiBaudRate", baud)
 
-    # Mirrors main.cpp's onRemoteSetting() range checks in that project -
-    # not exhaustive validation, just enough to catch an obvious typo
-    # locally instead of waiting on a round-trip rejection.
-    _POLYMERPAK_FIELD_RANGES = {
-        "siteLatitude": (-90.0, 90.0),
-        "siteLongitude": (-180.0, 180.0),
-        "sunElevationDeg": (0.0, 90.0),
-        "trackerStepDeg": (0.0001, 90.0),
-    }
-
-    def _on_polymerpak_field_editing_finished(self, key: str):
-        edit = self.polymerpak_edits[key]
-        # Same "only send if it actually changed, then lock back to
-        # double-click-only" discipline as _on_spi_address_editing_finished.
-        edit.exit_edit_mode()
-        if not self._mac:
-            return
-        raw = edit.text().strip()
-        if raw == self._polymerpak_last_known.get(key, ""):
-            return
-        try:
-            value = float(raw)
-        except ValueError:
-            QMessageBox.warning(self, "Invalid value", f"{key} must be a number.")
-            edit.setText(self._polymerpak_last_known.get(key, ""))
-            return
-        low, high = self._POLYMERPAK_FIELD_RANGES[key]
-        if not (low <= value <= high):
-            QMessageBox.warning(self, "Invalid value", f"{key} must be between {low} and {high}.")
-            edit.setText(self._polymerpak_last_known.get(key, ""))
-            return
-        self._polymerpak_last_known[key] = raw
-        self.polymerpak_status_label.setText(f"Sent - awaiting node confirmation ({key}={value})...")
-        self.config_setting_requested.emit(self._mac, key, value)
-
     def set_config_ack_status(self, key: str, accepted: bool):
-        label = self.polymerpak_status_label if key in self._POLYMERPAK_FIELD_RANGES else self.config_status_label
+        label = self.config_status_label
         if accepted:
             label.setText(f"\"{key}\" confirmed by node.")
         else:

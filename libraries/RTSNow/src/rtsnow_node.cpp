@@ -54,6 +54,11 @@ namespace
     bool s_pendingRegisterRequest = false;
     uint8_t s_pendingRegisterRequestMac[6];
 
+    bool s_pendingWriteRegister = false;
+    uint8_t s_pendingWriteRegisterMac[6];
+    RTSNOW_WriteRegister s_pendingWriteRegisterPayload;
+    uint32_t s_pendingWriteRegisterRequesterId = 0xFFFFFFFF;
+
     // ---- Firmware update over ESP-NOW (see RTSNOW_OTA_START's own
     // comment in rtsnow_protocol.h) ----
     //
@@ -473,6 +478,15 @@ namespace
             return;
         }
 
+        if (header.messageType == RTSNOW_WRITE_REGISTER && payloadLen >= static_cast<int>(sizeof(RTSNOW_WriteRegister)))
+        {
+            memcpy(&s_pendingWriteRegisterPayload, payload, sizeof(s_pendingWriteRegisterPayload));
+            memcpy(s_pendingWriteRegisterMac, mac, 6);
+            s_pendingWriteRegisterRequesterId = header.sourceID;
+            s_pendingWriteRegister = true;
+            return;
+        }
+
         // Firmware update over ESP-NOW (see RTSNOW_OTA_START's own
         // comment) - every message here just flags + copies the small
         // fixed-size payload; rtsnowNodeLoop() does the actual
@@ -672,6 +686,20 @@ void rtsnowNodeLoop()
         // else: this node has no register table to report - silently not
         // answered, same as an RTSNOW_SET_SETTING key this node doesn't
         // recognize.
+    }
+
+    if (s_pendingWriteRegister)
+    {
+        s_pendingWriteRegister = false;
+        RTSNOW_WriteRegisterAck ack{};
+        ack.reg = s_pendingWriteRegisterPayload.reg;
+        ack.ok = (s_config.onWriteRegister != nullptr &&
+                 s_config.onWriteRegister(s_pendingWriteRegisterPayload.reg, s_pendingWriteRegisterPayload.value))
+                    ? 1
+                    : 0;
+        sendTo(s_pendingWriteRegisterMac, RTSNOW_WRITE_REGISTER_ACK, &ack, sizeof(ack),
+               s_pendingWriteRegisterRequesterId);
+        Serial.printf("RTS-NOW: write register %u %s\n", ack.reg, ack.ok ? "accepted" : "rejected");
     }
 
     // Firmware update over ESP-NOW (see RTSNOW_OTA_START's own comment).

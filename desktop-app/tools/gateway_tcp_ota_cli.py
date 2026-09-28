@@ -4,12 +4,18 @@ AtomS3 + PoE Base Ethernet gateway) over its own TCP JSON-lines server -
 see gateway-firmware/src/main.cpp's "Firmware update over TCP" section
 (handle_ota_start_command/handle_ota_chunk_command/handle_ota_end_command).
 No ESP-NOW hop, no mac field, no relay - this connects straight to the
-target gateway's own IP:5055 and flashes it directly, same dual-partition
+target gateway's own IP:80 and flashes it directly, same dual-partition
 safety as every other RTS-NOW OTA path (self_ota_end() only applies +
 reboots after an MD5 match).
 
+Port defaults to 80, not a dedicated JSON-only port anymore - the gateway
+firmware now shares one TCP listener between this JSON protocol and its
+own HTML status site (see gateway-firmware's kHttpPort for why); an
+older gateway still running the pre-merge firmware needs --port 5055
+instead.
+
 Usage:
-    python3 gateway_tcp_ota_cli.py --host 10.13.1.198 --port 5055 --firmware path/to/firmware.bin
+    python3 gateway_tcp_ota_cli.py --host 10.13.1.198 --port 80 --firmware path/to/firmware.bin
 """
 
 import argparse
@@ -177,7 +183,7 @@ def push_firmware(gw: GatewayTcp, firmware_path: str, log=print, chunk_size: int
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--host", required=True, help="Gateway's IP, e.g. 10.13.1.198")
-    ap.add_argument("--port", type=int, default=5055)
+    ap.add_argument("--port", type=int, default=80)
     ap.add_argument("--firmware", required=True, help="Path to a built firmware.bin")
     ap.add_argument("--chunk-size", type=int, default=CHUNK_SIZE,
                     help=f"Override for bootstrapping a target still running firmware with a smaller "

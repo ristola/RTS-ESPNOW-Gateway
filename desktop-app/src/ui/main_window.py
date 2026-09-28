@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QSplitter,
     QStackedWidget,
@@ -33,10 +34,10 @@ from src.gateway.serial_client import GatewayClient
 from src.gateway.settings import get_default_gateway_ip, set_default_gateway_ip
 from src.ui.pages.dashboard_page import DashboardPage
 from src.ui.pages.dryer_detail_page import DryerDetailPage
-from src.ui.pages.espnow_flash_page import EspNowFlashPage
 from src.ui.pages.flash_node_page import FlashNodePage
 from src.ui.pages.mesh_page import MeshPage
 from src.ui.pages.node_detail_page import NodeDetailPage
+from src.ui.pages.polymerpak_detail_page import PolymerPakDetailPage
 from src.ui.pages.rtsnow_page import RtsNowPage
 
 POLL_INTERVAL_MS = 2000
@@ -243,7 +244,6 @@ class MainWindow(QMainWindow):
         self._add_nav_item(sidebar, "Hardware List", ("dashboard", None))
         self._add_nav_item(sidebar, self._RTSNOW_CHILD_INDENT + "Flash Node", ("flash_node", None))
         self._add_nav_item(sidebar, self._RTSNOW_CHILD_INDENT + "Mesh", ("mesh", None))
-        self._add_nav_item(sidebar, self._RTSNOW_CHILD_INDENT + "ESP-NOW Flash", ("espnow_flash", None))
         separator = self._add_nav_item(sidebar, "", ("separator", None))
         separator.setFlags(Qt.ItemFlag.NoItemFlags)  # blank spacer row - not selectable/clickable
         self._add_nav_item(sidebar, "RTSNow", ("rtsnow", None))
@@ -397,20 +397,51 @@ class MainWindow(QMainWindow):
             lambda ip, file_path: self._start_ota(ip, file_path, self.dryer_detail_page)
         )
         self.dryer_detail_page.rename_requested.connect(self._on_rename_requested)
+        self.dryer_detail_page.write_register_requested.connect(self._on_write_register_requested)
         self.pages.addWidget(self.dryer_detail_page)
+
+        self.polymerpak_detail_page = PolymerPakDetailPage()
+        # Same "reuses the generic handlers" reasoning as dryer_detail_page
+        # above - poll_registers_requested/config_setting_requested are
+        # still needed here (unlike DryerDetailPage), since this page's
+        # Configuration box is live-editable settings, same mechanism as
+        # NodeDetailPage's own SPI Address/Baud Rate.
+        self.polymerpak_detail_page.reboot_requested.connect(self._on_reboot_requested)
+        self.polymerpak_detail_page.ota_requested.connect(
+            lambda ip, file_path: self._start_ota(ip, file_path, self.polymerpak_detail_page)
+        )
+        self.polymerpak_detail_page.rename_requested.connect(self._on_rename_requested)
+        self.polymerpak_detail_page.poll_registers_requested.connect(self._on_poll_registers_requested)
+        self.polymerpak_detail_page.config_setting_requested.connect(self._on_config_setting_requested)
+        # Wrapped in a QScrollArea rather than added to the stack directly -
+        # QStackedWidget/QStackedLayout's own sizeHint() is the LARGEST of
+        # every page it holds, not just whichever is currently shown (a
+        # documented Qt behavior, so switching pages never triggers a
+        # window resize). This page's content (sun diagram + live status +
+        # configuration + remote control + OTA, all stacked with no
+        # scrolling of its own) is taller than Dryer OFFICE's own diagram
+        # page - added directly, it silently inflated the WHOLE stack's
+        # minimum height, pushing every other page's bottom controls off-
+        # screen too. Confirmed live: Dryer OFFICE's own Alarm/Menus/trend
+        # chart became unreachable the moment this page was added, despite
+        # nothing on that page changing. A QScrollArea's own sizeHint
+        # doesn't grow with its contents, so it no longer drags the shared
+        # stack's minimum size along with it - this page scrolls
+        # internally instead.
+        self.polymerpak_scroll = QScrollArea()
+        self.polymerpak_scroll.setWidget(self.polymerpak_detail_page)
+        self.polymerpak_scroll.setWidgetResizable(True)
+        self.pages.addWidget(self.polymerpak_scroll)
 
         self.flash_node_page = FlashNodePage()
         self.flash_node_page.scan_requested.connect(self._on_scan_nodes_requested)
-        self.flash_node_page.flash_requested.connect(self._on_flash_node_requested)
+        self.flash_node_page.flash_usb_requested.connect(self._on_flash_node_requested)
+        self.flash_node_page.flash_mesh_requested.connect(self._on_espnow_flash_requested)
+        self.flash_node_page.abort_mesh_requested.connect(self._on_espnow_flash_abort_requested)
         self.pages.addWidget(self.flash_node_page)
 
         self.mesh_page = MeshPage()
         self.pages.addWidget(self.mesh_page)
-
-        self.espnow_flash_page = EspNowFlashPage()
-        self.espnow_flash_page.flash_requested.connect(self._on_espnow_flash_requested)
-        self.espnow_flash_page.abort_requested.connect(self._on_espnow_flash_abort_requested)
-        self.pages.addWidget(self.espnow_flash_page)
 
         return self.pages
 
@@ -440,8 +471,6 @@ class MainWindow(QMainWindow):
             self.pages.setCurrentWidget(self.flash_node_page)
         elif role == "mesh":
             self.pages.setCurrentWidget(self.mesh_page)
-        elif role == "espnow_flash":
-            self.pages.setCurrentWidget(self.espnow_flash_page)
         elif role == "device":
             dev = self.known_devices.get(payload)
             if dev is not None:
@@ -481,16 +510,23 @@ class MainWindow(QMainWindow):
                 return
 
     def _show_device_page(self, dev: KnownDevice):
-        """Routes to the per-equipment-type detail page for `dev` - only
-        Dryer has one so far (DryerDetailPage); everything else (other
-        equipment types, or a device whose type isn't known yet - see
-        _device_info's comment) falls back to the generic NodeDetailPage,
-        same page every RTSNow device used exclusively before
-        DryerDetailPage existed."""
+        """Routes to the per-project/per-equipment-type detail page for
+        `dev` - Dryer (DryerDetailPage) and PolymerPak (PolymerPakDetailPage)
+        each have their own now; everything else (other equipment types,
+        or a device whose type isn't known yet - see _device_info's
+        comment) falls back to the generic NodeDetailPage, same page
+        every RTSNow device used exclusively before either dedicated page
+        existed. PolymerPak is routed by project_name directly rather
+        than equipmentType (which only ever gets decoded from SPI-CCP's
+        own Modbus model-type register - PolymerPak has no such concept
+        at all, see its own fillRegisterBlock())."""
         equipment_type = self._device_info.get(dev.mac, {}).get("equipmentType")
         if equipment_type == "Dryer":
             self.dryer_detail_page.show_device(dev)
             self.pages.setCurrentWidget(self.dryer_detail_page)
+        elif dev.project_name == "PolymerPak":
+            self.polymerpak_detail_page.show_device(dev)
+            self.pages.setCurrentWidget(self.polymerpak_scroll)
         else:
             self.node_detail_page.show_device(dev)
             self.pages.setCurrentWidget(self.node_detail_page)
@@ -730,6 +766,8 @@ class MainWindow(QMainWindow):
             self.node_detail_page.set_rename_status(status)
         if self.dryer_detail_page.current_mac() == mac:
             self.dryer_detail_page.set_rename_status(status)
+        if self.polymerpak_detail_page.current_mac() == mac:
+            self.polymerpak_detail_page.set_rename_status(status)
 
     def _on_reboot_requested(self, mac: str):
         # Same caveat as rename above: this `ack` only confirms the gateway
@@ -762,6 +800,10 @@ class MainWindow(QMainWindow):
 
     def _on_poll_registers_requested(self, mac: str):
         self._send({"cmd": "poll_registers", "mac": mac}, f"poll_registers {mac}")
+
+    def _on_write_register_requested(self, mac: str, reg: int, value: float):
+        self._send({"cmd": "write_register", "mac": mac, "reg": reg, "value": value},
+                   f"write_register {reg}={value} {mac}")
 
     # key -> RTSNOW_SettingPayload.valueType (see SPI-IM's onRemoteSetting()
     # in main.cpp/main_atom_node.cpp for the matching decode).
@@ -854,13 +896,13 @@ class MainWindow(QMainWindow):
             return
         self._log(f"-> Flashing {project_dir} to {port}")
         self._node_flasher = NodeFlasherClient(project_dir, port, environment or None)
-        self._node_flasher.progress.connect(self.flash_node_page.set_flash_progress)
-        self._node_flasher.log_line.connect(self.flash_node_page.append_log)
+        self._node_flasher.progress.connect(self.flash_node_page.set_usb_flash_progress)
+        self._node_flasher.log_line.connect(self.flash_node_page.append_usb_log)
         self._node_flasher.finished.connect(self._on_node_flash_finished)
         self._node_flasher.start()
 
     def _on_node_flash_finished(self, success: bool, message: str):
-        self.flash_node_page.set_flash_result(success, message)
+        self.flash_node_page.set_usb_flash_result(success, message)
         self._log(("Node flash succeeded: " if success else "Node flash FAILED: ") + message)
         self._node_flasher = None
 
@@ -870,7 +912,7 @@ class MainWindow(QMainWindow):
             return
         self._log(f"-> Building {project_dir} (env: {environment}) for ESP-NOW flash to {mac}")
         self._pio_build_client = PioBuildClient(project_dir, environment)
-        self._pio_build_client.log_line.connect(self.espnow_flash_page.append_log)
+        self._pio_build_client.log_line.connect(self.flash_node_page.append_mesh_log)
         self._pio_build_client.finished.connect(
             lambda ok, message, bin_path: self._on_espnow_build_finished(mac, ok, message, bin_path)
         )
@@ -879,17 +921,17 @@ class MainWindow(QMainWindow):
     def _on_espnow_build_finished(self, mac: str, ok: bool, message: str, bin_path: str):
         self._pio_build_client = None
         if not ok:
-            self.espnow_flash_page.set_result(False, message)
+            self.flash_node_page.set_mesh_result(False, message)
             return
-        self.espnow_flash_page.append_log(f"Build succeeded: {bin_path}")
+        self.flash_node_page.append_mesh_log(f"Build succeeded: {bin_path}")
         self._espnow_ota_transfer = EspNowOtaTransfer(self._send, mac, bin_path)
-        self._espnow_ota_transfer.progress.connect(self.espnow_flash_page.set_progress)
-        self._espnow_ota_transfer.log.connect(self.espnow_flash_page.append_log)
+        self._espnow_ota_transfer.progress.connect(self.flash_node_page.set_mesh_progress)
+        self._espnow_ota_transfer.log.connect(self.flash_node_page.append_mesh_log)
         self._espnow_ota_transfer.finished.connect(self._on_espnow_ota_finished)
         self._espnow_ota_transfer.start()
 
     def _on_espnow_ota_finished(self, success: bool, message: str):
-        self.espnow_flash_page.set_result(success, message)
+        self.flash_node_page.set_mesh_result(success, message)
         self._log(("ESP-NOW flash succeeded: " if success else "ESP-NOW flash FAILED: ") + message)
         self._espnow_ota_transfer = None
 
@@ -957,12 +999,16 @@ class MainWindow(QMainWindow):
                     self.node_detail_page.set_rename_status(rename_status)
                 if self.dryer_detail_page.current_mac() == mac:
                     self.dryer_detail_page.set_rename_status(rename_status)
+                if self.polymerpak_detail_page.current_mac() == mac:
+                    self.polymerpak_detail_page.set_rename_status(rename_status)
             elif key in (
                 "equipmentType", "model", "spiAddress", "spiBaudRate",
                 "siteLatitude", "siteLongitude", "sunElevationDeg", "trackerStepDeg",
             ):
                 if self.node_detail_page.current_mac() == mac:
                     self.node_detail_page.set_config_ack_status(key, accepted)
+                if self.polymerpak_detail_page.current_mac() == mac:
+                    self.polymerpak_detail_page.set_config_ack_status(key, accepted)
         elif event == "register_values":
             mac = obj.get("mac")
             values = obj.get("values", [])
@@ -970,6 +1016,10 @@ class MainWindow(QMainWindow):
             self._log(f"Received {len(values)} register(s) from {mac} starting at {start_register}.")
             if self.node_detail_page.current_mac() == mac:
                 self.node_detail_page.show_register_values(start_register, values)
+            if self.dryer_detail_page.current_mac() == mac:
+                self.dryer_detail_page.show_register_values(start_register, values)
+            if self.polymerpak_detail_page.current_mac() == mac:
+                self.polymerpak_detail_page.show_register_values(start_register, values)
             # Mesh fallback for a device with no IP (see _ensure_device_
             # info's own comment) - only fills in equipmentType/model if
             # nothing's cached yet, so a device that DOES have a direct-IP
@@ -993,6 +1043,12 @@ class MainWindow(QMainWindow):
                             or self.dryer_detail_page.current_mac() == mac
                         ):
                             self._show_device_page(dev)
+        elif event == "write_register_ack":
+            mac = obj.get("mac")
+            if self.dryer_detail_page.current_mac() == mac:
+                self.dryer_detail_page.on_write_register_ack(
+                    obj.get("reg", 0), bool(obj.get("ok")), obj.get("error", "")
+                )
         elif event == "espnow_ota_start_ack":
             if self._espnow_ota_transfer is not None:
                 self._espnow_ota_transfer.on_start_ack(obj.get("mac"), bool(obj.get("ok")), obj.get("message", ""))
@@ -1024,7 +1080,7 @@ class MainWindow(QMainWindow):
         self.known_devices = {d["mac"]: KnownDevice.from_json(d) for d in devices_json}
         self.node_network_page.update_devices(devices_json)
         self.mesh_page.update_devices(list(self.known_devices.values()))
-        self.espnow_flash_page.update_devices(list(self.known_devices.values()))
+        self.flash_node_page.update_devices(list(self.known_devices.values()))
         self._rebuild_all_project_children()
 
         rtsnow_devices = [dev for dev in self.known_devices.values() if dev.project_name == "RTSNow"]
@@ -1038,6 +1094,9 @@ class MainWindow(QMainWindow):
         current_dryer_mac = self.dryer_detail_page.current_mac()
         if current_dryer_mac and current_dryer_mac in self.known_devices:
             self.dryer_detail_page.refresh_if_current(self.known_devices[current_dryer_mac])
+        current_polymerpak_mac = self.polymerpak_detail_page.current_mac()
+        if current_polymerpak_mac and current_polymerpak_mac in self.known_devices:
+            self.polymerpak_detail_page.refresh_if_current(self.known_devices[current_polymerpak_mac])
 
     # Only re-sends a mesh poll_registers fallback request for the same
     # mac this often - it's relayed over ESP-NOW and a persistently weak-
@@ -1117,4 +1176,5 @@ class MainWindow(QMainWindow):
         # QThread is undefined behavior in Qt, not just a leak).
         self.node_detail_page.shutdown()
         self.dryer_detail_page.shutdown()
+        self.polymerpak_detail_page.shutdown()
         super().closeEvent(event)
