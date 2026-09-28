@@ -55,6 +55,12 @@ RENAME_RETRY_INTERVAL_MS = 1500
 RENAME_MAX_ATTEMPTS = 4
 RTSNOW_CHANNEL_MIN = 1
 RTSNOW_CHANNEL_MAX = 11
+# How long to wait between automatic reconnect attempts to the default
+# gateway IP after it drops (see _on_client_disconnected's own comment) -
+# cheap enough to retry indefinitely in the background (a failed
+# socket.create_connection() to an unreachable host returns in well under
+# this) without spamming the log every single attempt.
+AUTO_RECONNECT_INTERVAL_MS = 5000
 
 # main_window.py -> src/ui/ -> assets/RTSLOGO.png (Ristola Technical
 # Services' own logo, copied in from the sibling SPI-IM project's Assets/
@@ -77,6 +83,25 @@ class MainWindow(QMainWindow):
         # USB" from a real error worth a dialog, which every other
         # verify-timeout/error path below still wants.
         self._connecting_via_network = False
+        # The host from the most recent _connect_network() call, kept set
+        # across a verify failure/success and cleared only on a manual
+        # Disconnect or a manual USB Connect (see _disconnect()/
+        # _on_connect_clicked()) - this is what lets _on_client_disconnected
+        # tell "a network connection dropped on its own, keep retrying it"
+        # apart from "the user just clicked Disconnect", since
+        # NetworkGatewayClient's own `disconnected` signal fires identically
+        # either way (see network_client.py's run()).
+        self._network_host: str | None = None
+        # Set right before self.client.stop() in _disconnect() so the next
+        # _on_client_disconnected knows this exact drop was requested, not
+        # a real connection loss - see that method's own comment.
+        self._manual_disconnect_requested = False
+        # True once this session has already logged "reconnecting..." for
+        # the current unbroken run of auto-retries, so a gateway that stays
+        # down for a while doesn't get a fresh log line every single
+        # AUTO_RECONNECT_INTERVAL_MS tick - only the first drop and the
+        # eventual reconnect are worth a line.
+        self._auto_reconnect_logged = False
         self.known_devices: dict[str, KnownDevice] = {}
         self._pending_acks: dict[int, str] = {}
         self._ota_client: OtaPushClient | None = None
@@ -115,6 +140,10 @@ class MainWindow(QMainWindow):
         self._verify_timer = QTimer(self)
         self._verify_timer.setSingleShot(True)
         self._verify_timer.timeout.connect(self._on_verify_timeout)
+
+        self._auto_reconnect_timer = QTimer(self)
+        self._auto_reconnect_timer.setSingleShot(True)
+        self._auto_reconnect_timer.timeout.connect(self._on_auto_reconnect_timeout)
 
         self._build_ui()
         self._refresh_ports()
@@ -171,6 +200,16 @@ class MainWindow(QMainWindow):
         self.connect_btn = QPushButton("Connect")
         self.connect_btn.clicked.connect(self._on_connect_clicked)
         bar.addWidget(self.connect_btn)
+
+        # Separate from Connect (which always means "USB, from the Port
+        # dropdown above") - this is the only way to get back to the
+        # network gateway after it drops without restarting the whole app,
+        # since the auto-retry loop below only covers a drop that happens
+        # while nothing else has been manually requested in the meantime.
+        # Enabled/disabled alongside connect_btn in _set_connected_ui().
+        self.reconnect_gateway_btn = QPushButton("Reconnect to Gateway")
+        self.reconnect_gateway_btn.clicked.connect(self._on_reconnect_gateway_clicked)
+        bar.addWidget(self.reconnect_gateway_btn)
 
         bar.addSpacing(24)
         bar.addWidget(QLabel("Channel:"))
@@ -541,6 +580,7 @@ class MainWindow(QMainWindow):
     def _set_connected_ui(self, connected: bool):
         self.port_combo.setEnabled(not connected)
         self.connect_btn.setText("Disconnect" if connected else "Connect")
+        self.reconnect_gateway_btn.setEnabled(not connected)
         self.apply_channel_btn.setEnabled(connected)
         self.discover_btn.setEnabled(connected)
         self.channel_spin.setEnabled(connected)
@@ -573,6 +613,13 @@ class MainWindow(QMainWindow):
         if not port:
             QMessageBox.warning(self, "No port selected", "Select a serial port first.")
             return
+
+        # An explicit choice to use USB instead - stop background network
+        # auto-retries (see _on_client_disconnected's own comment) so they
+        # don't steal this connection out from under the user the next time
+        # the timer fires.
+        self._auto_reconnect_timer.stop()
+        self._network_host = None
 
         self._connecting_via_network = False
         self.client = GatewayClient(port)
@@ -613,11 +660,12 @@ class MainWindow(QMainWindow):
         user has touched anything - if a "Set As Default Gateway" IP was
         ever remembered (see settings.py), try it automatically rather
         than making the user click Connect and pick a USB port every
-        single launch. Silently falls through to the normal idle state
-        (manual USB selection still works exactly as before) if nothing's
-        there or nothing answers - see _on_verify_timeout/
-        _on_client_disconnected's own _connecting_via_network branches for
-        where that quiet fallback actually happens."""
+        single launch. If nothing answers (or it later drops after
+        connecting), this quietly keeps retrying in the background - see
+        _on_client_disconnected's own comment - rather than requiring a
+        manual Reconnect click or an app restart; manual USB selection via
+        Connect still works exactly as before at any point and cancels the
+        background retry (see _on_connect_clicked)."""
         default_ip = get_default_gateway_ip()
         if not default_ip:
             self.statusBar().showMessage("No default gateway set - select a USB port to connect manually")
@@ -627,6 +675,7 @@ class MainWindow(QMainWindow):
 
     def _connect_network(self, host: str):
         self._connecting_via_network = True
+        self._network_host = host
         self.client = NetworkGatewayClient(host)
         self.client.event_received.connect(self._on_event_received)
         self.client.raw_line.connect(self._on_raw_line)
@@ -647,30 +696,91 @@ class MainWindow(QMainWindow):
         self._poll_timer.start(POLL_INTERVAL_MS)
 
     def _disconnect(self):
+        # Distinguishes a deliberate Disconnect click from the connection
+        # just dropping on its own - NetworkGatewayClient's `disconnected`
+        # signal fires identically either way (see network_client.py's
+        # run(), the `finally` block emits it regardless of why the loop
+        # exited), so this is the only way _on_client_disconnected can
+        # tell them apart and knows NOT to auto-retry a connection the
+        # user just asked to close.
+        self._manual_disconnect_requested = True
         if self.client is not None:
             self.client.stop()
         self._poll_timer.stop()
         self._verify_timer.stop()
+        self._auto_reconnect_timer.stop()
 
     def _on_client_disconnected(self):
+        was_manual = self._manual_disconnect_requested
+        self._manual_disconnect_requested = False
         was_connecting_via_network = self._connecting_via_network
         already_verified = self._verified
+        network_host = self._network_host
         self.client = None
         self._connected_port = None
         self._verified = False
         self._connecting_via_network = False
         self._set_connected_ui(False)
-        if was_connecting_via_network and not already_verified:
-            # Expected right now, not an error - see this file's own
-            # NetworkGatewayClient import comment and the module-level note
-            # in network_client.py: no device yet runs the TCP gateway
-            # server this would need to actually succeed against. Quiet
-            # fallback to the normal manual-USB idle state, no dialog.
-            self.statusBar().showMessage("No Gateway Discovered - select a USB port to connect manually")
-            self._log("No network gateway found at the default IP - select a USB port to connect manually.")
+
+        if was_manual:
+            # The user asked for this - go fully idle, no retry loop.
+            self._network_host = None
+            self._auto_reconnect_timer.stop()
+            self._auto_reconnect_logged = False
+            self.statusBar().showMessage("Not connected")
+            self._log("Disconnected.")
             return
+
+        if network_host is not None:
+            # A network connection (whether to the remembered default IP
+            # at startup, via the Reconnect button, or a prior auto-retry)
+            # ended on its own - the gateway rebooting (e.g. for an OTA
+            # push), a brief Ethernet/WiFi hiccup, or it simply not being
+            # up yet are all just as likely as it being gone for good, so
+            # this keeps retrying the same host in the background rather
+            # than requiring the user to notice and click Reconnect (or
+            # worse, restart the whole app) every time. self._network_host
+            # is deliberately left set here (not cleared) so the retry
+            # below has somewhere to reconnect to - only a manual
+            # Disconnect or Connect-via-USB (see _on_connect_clicked)
+            # clears it.
+            if not self._auto_reconnect_logged:
+                self._auto_reconnect_logged = True
+                if was_connecting_via_network and not already_verified:
+                    self._log(f"No response from {network_host} yet - retrying in the background "
+                              f"every {AUTO_RECONNECT_INTERVAL_MS // 1000}s (use a USB port to connect "
+                              f"manually instead).")
+                else:
+                    self._log(f"Lost connection to {network_host} - retrying automatically every "
+                              f"{AUTO_RECONNECT_INTERVAL_MS // 1000}s...")
+            self.statusBar().showMessage(f"Disconnected from {network_host} - retrying...")
+            self._auto_reconnect_timer.start(AUTO_RECONNECT_INTERVAL_MS)
+            return
+
         self.statusBar().showMessage("Not connected")
         self._log("Disconnected.")
+
+    def _on_auto_reconnect_timeout(self):
+        if self.client is not None or self._network_host is None:
+            return
+        self._connect_network(self._network_host)
+
+    def _on_reconnect_gateway_clicked(self):
+        if self.client is not None:
+            return
+        default_ip = get_default_gateway_ip()
+        if not default_ip:
+            QMessageBox.warning(
+                self, "No default gateway set",
+                "No default gateway IP has been remembered yet.\n\n"
+                "Right-click a discovered device in the Known Devices list "
+                "and choose \"Set As Default Gateway\" first.",
+            )
+            return
+        self._auto_reconnect_timer.stop()
+        self._auto_reconnect_logged = False
+        self._log(f"Reconnecting to {default_ip}...")
+        self._connect_network(default_ip)
 
     def _on_client_error(self, message: str):
         self._log(f"ERROR: {message}")
@@ -951,6 +1061,10 @@ class MainWindow(QMainWindow):
             self._verified = True
             self._verify_timer.stop()
             self._connecting_via_network = False
+            # Reset so the NEXT drop (if any) logs its own "lost
+            # connection.../retrying..." line instead of staying silent
+            # because an earlier, now-resolved drop already set this.
+            self._auto_reconnect_logged = False
             # self._connected_port, not the USB port combo's current
             # selection - the latter is meaningless (and possibly stale/
             # wrong) for a NetworkGatewayClient connection, which was
